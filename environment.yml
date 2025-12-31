@@ -1,0 +1,54 @@
+# Conda环境配置文件
+# 使用方法: conda env create -f environment.yml
+
+name: elderly-assistant
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python版本
+  - python=3.10
+  
+  # 基础依赖
+  - pip
+  - numpy>=1.24.0
+  - pillow>=10.0.0
+  
+  # 音频处理 (conda安装更稳定)
+  - portaudio
+  - pyaudio>=0.2.14
+  
+  # 网络相关
+  - pip:
+    # Web框架
+    - fastapi>=0.104.0
+    - uvicorn>=0.24.0
+    - pydantic>=2.5.0
+    
+    # HTTP/WebSocket客户端
+    - httpx>=0.25.0
+    - websockets>=12.0
+    
+    # 屏幕截图
+    - mss>=9.0.0
+    
+    # 鼠标键盘控制
+    - pynput>=1.7.6
+    
+    # 图结构
+    - networkx>=3.2.0
+    
+    # 缓存
+    - redis>=5.0.0
+    
+    # 配置和日志
+    - python-dotenv>=1.0.0
+    - loguru>=0.7.0
+    
+    # 开发依赖
+    - pytest>=7.4.0
+    - pytest-asyncio>=0.21.0
+    - hypothesis>=6.92.0
+    - ruff>=0.1.0
+    - mypy>=1.7.0

@@ -1,9 +1,10 @@
-"""视觉服务 - 使用Qwen-VL进行屏幕理解"""
+"""视觉服务 - 使用Sophnet Qwen-VL进行屏幕理解"""
 
 from __future__ import annotations
 
 import base64
 import io
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -12,6 +13,15 @@ from loguru import logger
 from PIL import Image
 
 from ..config import config
+
+
+@dataclass
+class VLConfig:
+    """多模态模型配置"""
+    project_id: str = ""
+    easyllm_id: str = ""
+    api_key: str = ""
+    base_url: str = "https://www.sophnet.com/api/open-apis/projects"
 
 
 @dataclass
@@ -38,22 +48,80 @@ class ScreenAnalysis:
 
 
 class VisionService:
-    """视觉服务"""
+    """视觉服务 - 使用Sophnet多模态API"""
     
-    def __init__(self) -> None:
-        self._api_url = config.api.qwen_vl_url
+    def __init__(self, vl_config: Optional[VLConfig] = None) -> None:
+        # 使用传入配置或从全局配置获取
+        if vl_config:
+            self._config = vl_config
+        else:
+            self._config = VLConfig(
+                project_id=config.api.vl_project_id,
+                easyllm_id=config.api.vl_easyllm_id,
+                api_key=config.api.api_key,
+                base_url=config.api.sophnet_base_url,
+            )
+        
         self._client: Optional[httpx.AsyncClient] = None
+    
+    def _build_api_url(self) -> str:
+        """构建API URL"""
+        return f"{self._config.base_url}/{self._config.project_id}/easyllms/{self._config.easyllm_id}/chat"
     
     async def initialize(self) -> None:
         """初始化服务"""
         self._client = httpx.AsyncClient(timeout=60.0)
-        logger.info(f"Vision服务初始化完成，API地址: {self._api_url}")
+        logger.info(f"Vision服务初始化完成")
+        logger.info(f"  - Project ID: {self._config.project_id}")
+        logger.info(f"  - EasyLLM ID: {self._config.easyllm_id}")
     
     async def close(self) -> None:
         """关闭服务"""
         if self._client:
             await self._client.aclose()
             self._client = None
+    
+    async def _call_vl_api(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2000,
+    ) -> str:
+        """调用Sophnet多模态API"""
+        if not self._client:
+            raise RuntimeError("Vision服务未初始化")
+        
+        url = self._build_api_url()
+        
+        try:
+            response = await self._client.post(
+                url,
+                json={
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                },
+                headers={
+                    "Authorization": f"Bearer {self._config.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            # Sophnet API 响应格式
+            if "choices" in result:
+                return result["choices"][0]["message"]["content"]
+            elif "content" in result:
+                return result["content"]
+            elif "response" in result:
+                return result["response"]
+            else:
+                logger.warning(f"未知的API响应格式: {result}")
+                return str(result)
+                
+        except httpx.HTTPError as e:
+            logger.error(f"VL API调用失败: {e}")
+            raise
     
     async def capture_screen(self) -> bytes:
         """截取屏幕"""
@@ -117,39 +185,29 @@ class VisionService:
             # 构建提示词
             prompt = self._build_analysis_prompt(user_intent)
             
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen-vl",
-                    "messages": [
+            # 构建消息 (多模态格式)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
                         {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/png;base64,{image_base64}"
-                                    }
-                                },
-                                {
-                                    "type": "text",
-                                    "text": prompt
-                                }
-                            ]
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
                         }
-                    ],
-                    "max_tokens": 2000,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
-            )
-            response.raise_for_status()
+                    ]
+                }
+            ]
             
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
+            content = await self._call_vl_api(messages, max_tokens=2000)
             return self._parse_analysis_result(content)
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"屏幕分析请求失败: {e}")
             return ScreenAnalysis()
     
@@ -163,30 +221,49 @@ class VisionService:
 3. elements: 可交互元素列表，每个元素包含：
    - element_type: 类型（button/text/input/icon/link）
    - text: 元素文本
-   - description: 用老年人能理解的语言描述
-   - bbox: [x, y, width, height]
+   - description: 用老年人能理解的语言描述（如"绿色的聊天按钮"）
+   - bbox: [x, y, width, height] 元素位置
    - is_clickable: 是否可点击
    - is_input: 是否是输入框
-4. description: 用简单的语言描述当前屏幕
+4. description: 用简单的语言描述当前屏幕（适合老年人理解）
 5. suggested_actions: 建议的操作
 6. warnings: 安全警告（如发现可疑内容、诈骗信息等）
 
 请特别注意识别：
-- 广告和弹窗
-- 可能的诈骗信息
+- 广告和弹窗（老年人称为"脏东西"）
+- 可能的诈骗信息（中奖、转账、验证码等）
 - 需要输入敏感信息的地方
 - 付款或转账相关内容
+
+返回格式示例：
+```json
+{
+    "app_name": "微信",
+    "screen_type": "app",
+    "elements": [
+        {
+            "element_type": "button",
+            "text": "发现",
+            "description": "底部的发现按钮",
+            "bbox": [200, 800, 100, 50],
+            "is_clickable": true,
+            "is_input": false
+        }
+    ],
+    "description": "这是微信的主界面，可以看到聊天列表",
+    "suggested_actions": ["点击底部的通讯录可以找联系人"],
+    "warnings": []
+}
+```
 """
         
         if user_intent:
-            base_prompt += f"\n用户想要：{user_intent}\n请重点关注与此相关的元素。"
+            base_prompt += f"\n用户想要：{user_intent}\n请重点关注与此相关的元素，并给出具体的操作建议。"
         
         return base_prompt
     
     def _parse_analysis_result(self, content: str) -> ScreenAnalysis:
         """解析分析结果"""
-        import json
-        
         try:
             # 尝试提取JSON
             start = content.find("{")
@@ -281,36 +358,26 @@ class VisionService:
 2. 实际发生了什么变化？
 3. 如果失败，可能的原因是什么？
 
-用简单的语言回答，适合老年人理解。"""
+用简单的语言回答，适合老年人理解。不要使用技术术语。"""
             
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen-vl",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{before_b64}"}},
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{after_b64}"}},
-                                {"type": "text", "text": prompt}
-                            ]
-                        }
-                    ],
-                    "max_tokens": 500,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
-            )
-            response.raise_for_status()
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{before_b64}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{after_b64}"}},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
             
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
+            content = await self._call_vl_api(messages, max_tokens=500)
             
             # 简单判断是否成功
             success = "是" in content[:50] or "成功" in content[:50]
             
             return success, content
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"验证操作结果失败: {e}")
             return False, "无法验证操作结果"

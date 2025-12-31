@@ -4,27 +4,33 @@
 
 ## 核心特性
 
-### 1. 语义到操作映射 (Semantic-to-Procedural Mapping)
+### 1. SimToM心智理论意图理解
+- 基于论文 "Think Twice: Perspective-Taking Improves Large Language Models' Theory-of-Mind Capabilities"
+- 两阶段框架：视角转换 (Perspective-Taking) + 意图推理 (Question-Answering)
+- BDI模型分析：Beliefs（信念）、Desires（愿望）、Intentions（意图）
 - 理解老年人的模糊表述（如"手机吃钱"="流量超标"）
+
+### 2. 语义到操作映射 (Semantic-to-Procedural Mapping)
 - 将生活化语言转换为具体操作步骤
 - 支持家庭成员称呼映射（如"老二"="张三"）
+- 自动检测系统已安装应用，智能推荐目标应用
 
-### 2. 多模态交互
-- 语音输入：使用FunASR实时语音识别
+### 3. 多模态交互
+- 语音输入：使用Sophnet流式WebSocket ASR
 - 语音输出：使用CosyVoice语音合成，语速可调
-- 屏幕理解：使用Qwen-VL分析当前屏幕内容
+- 屏幕理解：使用Qwen2.5-VL分析当前屏幕内容
 
-### 3. 智能任务规划 (ReAct模式)
+### 4. 智能任务规划 (ReAct模式)
 - 自动分解复杂任务为简单步骤
 - 每一步给予清晰的语音指导
 - 错误时自动重新规划，提供恢复方案
 
-### 4. 知识库与RAG
+### 5. 知识库与RAG
 - 从短视频平台提取操作知识
 - 使用思维导图方式压缩上下文
 - 语义搜索相关操作指南
 
-### 5. 安全防护
+### 6. 安全防护
 - 诈骗信息检测与警告
 - 敏感操作确认机制
 - 隐私数据保护
@@ -33,9 +39,10 @@
 
 | 组件 | 技术 |
 |------|------|
-| 多模态理解 | Qwen3-VL-235B-A22B-Instruct |
-| 语言理解 | Qwen3-235B-A22B-Instruct-2507 |
-| 语音识别 | FunASR (实时) |
+| 多模态理解 | Qwen2.5-VL-72B-Instruct (Sophnet API) |
+| 语言理解 | Qwen2.5-72B-Instruct (Sophnet API) |
+| 意图理解 | SimToM + BDI模型 |
+| 语音识别 | Sophnet WebSocket ASR |
 | 语音合成 | CosyVoice |
 | 向量模型 | BGE-M3 |
 | 后端框架 | FastAPI |
@@ -84,7 +91,10 @@ elderly-assistant-agent/
 
 ```bash
 cd elderly-assistant-agent
-pip install -e .
+pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# Windows下安装pyaudio（用于麦克风采集）
+conda install pyaudio
 ```
 
 ### 2. 配置环境变量
@@ -94,13 +104,37 @@ cp .env.example .env
 # 编辑 .env 文件，配置API地址
 ```
 
-### 3. 启动服务
+环境变量说明：
+```bash
+# Sophnet API配置 (OpenAI兼容格式)
+SOPHNET_API_KEY=your_api_key_here
+LLM_MODEL=Qwen2.5-72B-Instruct
+VL_MODEL=Qwen2.5-VL-72B-Instruct
+
+# ASR配置 (WebSocket)
+ASR_PROJECT_ID=your_project_id
+ASR_EASYLLM_ID=your_easyllm_id
+```
+
+### 3. 测试LLM服务
+
+```bash
+cd elderly-assistant-agent
+python tests/test_llm_service.py
+```
+
+测试场景包括：
+- 发邮件：`"我想给老同事发个信"`
+- Word问题：`"我写的东西找不到了，刚才还在的"`
+- 上网看新闻：`"我想看看人民网上有什么新消息"`
+
+### 4. 启动服务
 
 ```bash
 python -m src.main
 ```
 
-### 4. API使用
+### 5. API使用
 
 ```bash
 # 文本输入
@@ -111,6 +145,31 @@ curl -X POST http://localhost:8080/api/input/text \
 # 获取会话状态
 curl http://localhost:8080/api/session/state
 ```
+
+## Sophnet API配置
+
+本项目使用Sophnet API（OpenAI兼容格式）：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="YOUR_API_KEY",
+    base_url="https://www.sophnet.com/api/open-apis/v1"
+)
+
+response = client.chat.completions.create(
+    model="Qwen2.5-72B-Instruct",
+    messages=[
+        {"role": "system", "content": "你是一个帮助老年人使用电脑的助手"},
+        {"role": "user", "content": "我想给老同事发个信"},
+    ]
+)
+```
+
+支持的模型：
+- 纯文本：`Qwen2.5-72B-Instruct`, `Qwen2.5-32B-Instruct`, `DeepSeek-v3`
+- 多模态：`Qwen2.5-VL-72B-Instruct`, `Qwen2.5-VL-32B-Instruct`
 
 ## API接口
 

@@ -17,7 +17,7 @@ from ..models.action import Action, ActionResult, ActionStatus
 from ..models.task import Task, TaskStatus, TaskPlan
 from ..models.session import Session, SessionState, UserProfile
 from ..models.knowledge import KnowledgeGraph
-from ..services.asr_service import ASRService, ASRResult
+from ..services.asr_service import ASRService, ASRResult, ASRConfig
 from ..services.tts_service import TTSService
 from ..services.vision_service import VisionService, ScreenAnalysis
 from ..services.llm_service import LLMService
@@ -79,7 +79,16 @@ class ElderlyAssistantAgent:
         logger.info("正在初始化老年人助手Agent...")
         
         # 初始化所有服务
-        self._asr = ASRService()
+        # ASR使用配置初始化
+        asr_config = ASRConfig(
+            project_id=config.asr.project_id,
+            easyllm_id=config.asr.easyllm_id,
+            api_key=config.asr.api_key,
+            format=config.asr.format,
+            sample_rate=config.asr.sample_rate,
+            heartbeat=config.asr.heartbeat,
+        )
+        self._asr = ASRService(asr_config)
         self._tts = TTSService()
         self._vision = VisionService()
         self._llm = LLMService()

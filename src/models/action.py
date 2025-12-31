@@ -94,7 +94,7 @@ class Action:
         descriptions = {
             ActionType.CLICK: f"点击{self.element_description}",
             ActionType.DOUBLE_CLICK: f"双击{self.element_description}",
-            ActionType.TYPE: f"输入"{self.text}"",
+            ActionType.TYPE: f'输入"{self.text}"',
             ActionType.SCROLL: f"向{self._scroll_direction_cn()}滑动",
             ActionType.WAIT: "稍等一下",
             ActionType.BACK: "返回上一步",
