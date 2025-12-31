@@ -1,0 +1,51 @@
+[project]
+name = "elderly-assistant-agent"
+version = "0.1.0"
+description = "AI助手帮助老年人使用电脑 - 语义到操作映射"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.5.0",
+    "httpx>=0.25.0",
+    "websockets>=12.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "mss>=9.0.0",
+    "pyaudio>=0.2.14",
+    "networkx>=3.2.0",
+    "redis>=5.0.0",
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "hypothesis>=6.92.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[project.scripts]
+elderly-assistant = "src.main:main"
+elderly-assistant-cli = "src.cli:main"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
