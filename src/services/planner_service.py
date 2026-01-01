@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import httpx
 from loguru import logger
@@ -15,6 +15,9 @@ from ..models.action import Action, ActionType, ActionStatus
 from ..models.task import Task, TaskStep, TaskPlan, TaskStatus
 from ..models.knowledge import KnowledgeGraph, OperationGuide
 from .vision_service import ScreenAnalysis
+
+if TYPE_CHECKING:
+    from ..knowledge.rag_service import RAGService
 
 
 class PlannerState(str, Enum):
@@ -51,15 +54,20 @@ class PlannerService:
     """任务规划服务 - 使用ReAct模式"""
     
     def __init__(self) -> None:
-        self._api_url = config.api.qwen_llm_url
+        self._base_url = config.api.sophnet_base_url
+        self._api_key = config.api.api_key
+        self._model = config.api.llm_model
         self._client: Optional[httpx.AsyncClient] = None
         self._knowledge_graph: Optional[KnowledgeGraph] = None
+        self._rag_service: Optional["RAGService"] = None
     
     async def initialize(self) -> None:
         """初始化服务"""
-        self._client = httpx.AsyncClient(timeout=60.0)
+        self._client = httpx.AsyncClient(timeout=120.0)
         self._knowledge_graph = KnowledgeGraph()
         logger.info("Planner服务初始化完成")
+        logger.info(f"  - API URL: {self._base_url}/chat/completions")
+        logger.info(f"  - 模型: {self._model}")
     
     async def close(self) -> None:
         """关闭服务"""
@@ -68,8 +76,52 @@ class PlannerService:
             self._client = None
     
     def set_knowledge_graph(self, kg: KnowledgeGraph) -> None:
-        """设置知识图谱"""
+        """设置知识图谱（兼容旧接口）"""
         self._knowledge_graph = kg
+    
+    def set_rag_service(self, rag_service: "RAGService") -> None:
+        """设置RAG服务（推荐使用）"""
+        self._rag_service = rag_service
+        logger.info("Planner已关联RAG服务")
+    
+    async def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> str:
+        """调用LLM API"""
+        if not self._client:
+            raise RuntimeError("Planner服务未初始化")
+        
+        try:
+            logger.debug(f"调用LLM API: {self._base_url}/chat/completions")
+            
+            response = await self._client.post(
+                f"{self._base_url}/chat/completions",
+                json={
+                    "model": self._model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.3,
+                },
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            logger.debug(f"LLM响应长度: {len(content)}")
+            return content
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"LLM API HTTP错误: {e.response.status_code}")
+            logger.error(f"响应内容: {e.response.text}")
+            raise
+        except httpx.HTTPError as e:
+            logger.error(f"LLM API调用失败: {type(e).__name__}: {e}")
+            raise
     
     async def create_plan(
         self,
@@ -77,9 +129,6 @@ class PlannerService:
         screen_analysis: Optional[ScreenAnalysis] = None,
     ) -> TaskPlan:
         """创建任务计划"""
-        if not self._client:
-            raise RuntimeError("Planner服务未初始化")
-        
         # 获取相关知识
         knowledge_context = await self._get_relevant_knowledge(intent)
         
@@ -91,27 +140,14 @@ class PlannerService:
         )
         
         try:
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen",
-                    "messages": [
-                        {"role": "system", "content": self._get_system_prompt()},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 2000,
-                    "temperature": 0.3,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
+            content = await self._call_llm(
+                system_prompt=self._get_system_prompt(),
+                user_prompt=prompt,
+                max_tokens=2000,
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
             return self._parse_plan(content, intent)
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"创建计划失败: {e}")
             return TaskPlan(intent=intent)
     
@@ -161,13 +197,15 @@ class PlannerService:
         if screen_analysis:
             parts.append(f"\n当前屏幕：{screen_analysis.description}")
             parts.append(f"当前应用：{screen_analysis.app_name}")
+            parts.append(f"页面类型：{screen_analysis.screen_type}")
             
-            if screen_analysis.elements:
-                elements_desc = [
-                    f"- {e.description or e.text}"
-                    for e in screen_analysis.elements[:10]
-                ]
-                parts.append(f"可见元素：\n" + "\n".join(elements_desc))
+            # 使用建议的操作
+            if screen_analysis.suggested_actions:
+                parts.append(f"建议操作：{', '.join(screen_analysis.suggested_actions)}")
+            
+            # 如果有警告，提醒规划器
+            if screen_analysis.warnings:
+                parts.append(f"⚠️ 注意：{', '.join(screen_analysis.warnings)}")
         
         if knowledge_context:
             parts.append(f"\n参考知识：\n{knowledge_context}")
@@ -177,12 +215,31 @@ class PlannerService:
         return "\n".join(parts)
     
     async def _get_relevant_knowledge(self, intent: Intent) -> str:
-        """获取相关知识"""
+        """获取相关知识 - 优先使用RAG服务"""
+        query = intent.normalized_text or intent.raw_text
+        
+        # 优先使用 RAG 服务（向量语义检索）
+        if self._rag_service:
+            try:
+                # 使用带查询扩展的检索（支持老年人语言映射）
+                rag_result = await self._rag_service.retrieve_with_expansion(
+                    query=query,
+                    top_k=3,
+                    min_score=0.3,  # 降低阈值以获取更多结果
+                )
+                
+                if rag_result.context:
+                    logger.debug(f"RAG检索成功，置信度: {rag_result.confidence:.2f}")
+                    return rag_result.context
+                    
+            except Exception as e:
+                logger.warning(f"RAG检索失败，回退到知识图谱: {e}")
+        
+        # 回退到知识图谱的简单关键词匹配
         if not self._knowledge_graph:
             return ""
         
         # 搜索相关操作指南
-        query = intent.normalized_text or intent.raw_text
         guides = self._knowledge_graph.search_guides(query, top_k=3)
         
         if not guides:
@@ -282,8 +339,16 @@ class PlannerService:
         current_screen: Optional[ScreenAnalysis] = None,
     ) -> TaskPlan:
         """错误后重新规划"""
-        if not self._client or not task.plan:
-            raise RuntimeError("无法重新规划")
+        if not self._client:
+            logger.warning("Planner客户端未初始化，无法重新规划")
+            return TaskPlan(intent=task.intent or Intent())
+        
+        if not task.plan:
+            logger.warning("任务没有计划，尝试创建新计划")
+            return await self.create_plan(
+                intent=task.intent or Intent(),
+                screen_analysis=current_screen,
+            )
         
         # 获取已完成的步骤
         completed_steps = [
@@ -306,27 +371,14 @@ class PlannerService:
 如果需要回退，请先说明如何回退到安全状态。"""
         
         try:
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen",
-                    "messages": [
-                        {"role": "system", "content": self._get_system_prompt()},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 2000,
-                    "temperature": 0.3,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
+            content = await self._call_llm(
+                system_prompt=self._get_system_prompt(),
+                user_prompt=prompt,
+                max_tokens=2000,
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
             return self._parse_plan(content, task.intent or Intent())
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"重新规划失败: {e}")
             return TaskPlan()
     
@@ -345,34 +397,18 @@ class PlannerService:
         context: PlannerContext,
     ) -> ReActStep:
         """ReAct模式：建议下一步动作"""
-        if not self._client:
-            raise RuntimeError("Planner服务未初始化")
-        
         # 构建ReAct提示
         prompt = self._build_react_prompt(context)
         
         try:
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen",
-                    "messages": [
-                        {"role": "system", "content": self._get_react_system_prompt()},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 500,
-                    "temperature": 0.3,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
+            content = await self._call_llm(
+                system_prompt=self._get_react_system_prompt(),
+                user_prompt=prompt,
+                max_tokens=500,
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
             return self._parse_react_step(content)
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"ReAct步骤生成失败: {e}")
             return ReActStep(thought="无法生成下一步", state=PlannerState.FAILED)
     
