@@ -123,46 +123,63 @@ class VisionService:
         messages: list[dict],
         model: str,
         max_tokens: int = 2000,
+        max_retries: int = 3,
     ) -> str:
-        """调用VL API"""
+        """调用VL API（带重试机制）"""
         if not self._client:
             raise RuntimeError("Vision服务未初始化")
         
         url = self._build_api_url()
+        last_error = None
         
-        try:
-            logger.debug(f"调用VL API: model={model}")
-            
-            response = await self._client.post(
-                url,
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                },
-                headers={
-                    "Authorization": f"Bearer {self._config.api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            if "choices" in result and len(result["choices"]) > 0:
-                content = result["choices"][0]["message"]["content"]
-                logger.debug(f"VL API响应长度: {len(content)}")
-                return content
-            
-            logger.warning(f"未知的API响应格式: {result}")
-            return str(result)
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"调用VL API: model={model}, 尝试 {attempt + 1}/{max_retries}")
                 
-        except httpx.HTTPStatusError as e:
-            logger.error(f"VL API HTTP错误: {e.response.status_code}")
-            logger.error(f"响应内容: {e.response.text}")
-            raise
-        except httpx.HTTPError as e:
-            logger.error(f"VL API调用失败: {type(e).__name__}: {e}")
-            raise
+                response = await self._client.post(
+                    url,
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {self._config.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                response.raise_for_status()
+                
+                result = response.json()
+                if "choices" in result and len(result["choices"]) > 0:
+                    content = result["choices"][0]["message"]["content"]
+                    logger.debug(f"VL API响应长度: {len(content)}")
+                    return content
+                
+                logger.warning(f"未知的API响应格式: {result}")
+                return str(result)
+                    
+            except httpx.HTTPStatusError as e:
+                logger.error(f"VL API HTTP错误: {e.response.status_code}")
+                logger.error(f"响应内容: {e.response.text}")
+                last_error = e
+                # HTTP错误不重试（如401、403等）
+                break
+            except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as e:
+                logger.warning(f"VL API网络错误 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+                last_error = e
+                if attempt < max_retries - 1:
+                    # 等待后重试
+                    import asyncio
+                    await asyncio.sleep(2 ** attempt)  # 指数退避: 1s, 2s, 4s
+                    continue
+            except httpx.HTTPError as e:
+                logger.error(f"VL API调用失败: {type(e).__name__}: {e}")
+                last_error = e
+                break
+        
+        # 所有重试都失败
+        raise last_error or RuntimeError("VL API调用失败")
     
     async def capture_screen(self) -> tuple[bytes, tuple[int, int]]:
         """截取屏幕，返回(图片数据, 原始尺寸)"""

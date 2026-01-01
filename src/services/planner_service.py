@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import httpx
 from loguru import logger
@@ -15,6 +15,9 @@ from ..models.action import Action, ActionType, ActionStatus
 from ..models.task import Task, TaskStep, TaskPlan, TaskStatus
 from ..models.knowledge import KnowledgeGraph, OperationGuide
 from .vision_service import ScreenAnalysis
+
+if TYPE_CHECKING:
+    from ..knowledge.rag_service import RAGService
 
 
 class PlannerState(str, Enum):
@@ -56,6 +59,7 @@ class PlannerService:
         self._model = config.api.llm_model
         self._client: Optional[httpx.AsyncClient] = None
         self._knowledge_graph: Optional[KnowledgeGraph] = None
+        self._rag_service: Optional["RAGService"] = None
     
     async def initialize(self) -> None:
         """初始化服务"""
@@ -72,8 +76,13 @@ class PlannerService:
             self._client = None
     
     def set_knowledge_graph(self, kg: KnowledgeGraph) -> None:
-        """设置知识图谱"""
+        """设置知识图谱（兼容旧接口）"""
         self._knowledge_graph = kg
+    
+    def set_rag_service(self, rag_service: "RAGService") -> None:
+        """设置RAG服务（推荐使用）"""
+        self._rag_service = rag_service
+        logger.info("Planner已关联RAG服务")
     
     async def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> str:
         """调用LLM API"""
@@ -206,12 +215,31 @@ class PlannerService:
         return "\n".join(parts)
     
     async def _get_relevant_knowledge(self, intent: Intent) -> str:
-        """获取相关知识"""
+        """获取相关知识 - 优先使用RAG服务"""
+        query = intent.normalized_text or intent.raw_text
+        
+        # 优先使用 RAG 服务（向量语义检索）
+        if self._rag_service:
+            try:
+                # 使用带查询扩展的检索（支持老年人语言映射）
+                rag_result = await self._rag_service.retrieve_with_expansion(
+                    query=query,
+                    top_k=3,
+                    min_score=0.3,  # 降低阈值以获取更多结果
+                )
+                
+                if rag_result.context:
+                    logger.debug(f"RAG检索成功，置信度: {rag_result.confidence:.2f}")
+                    return rag_result.context
+                    
+            except Exception as e:
+                logger.warning(f"RAG检索失败，回退到知识图谱: {e}")
+        
+        # 回退到知识图谱的简单关键词匹配
         if not self._knowledge_graph:
             return ""
         
         # 搜索相关操作指南
-        query = intent.normalized_text or intent.raw_text
         guides = self._knowledge_graph.search_guides(query, top_k=3)
         
         if not guides:
@@ -311,8 +339,16 @@ class PlannerService:
         current_screen: Optional[ScreenAnalysis] = None,
     ) -> TaskPlan:
         """错误后重新规划"""
-        if not self._client or not task.plan:
-            raise RuntimeError("无法重新规划")
+        if not self._client:
+            logger.warning("Planner客户端未初始化，无法重新规划")
+            return TaskPlan(intent=task.intent or Intent())
+        
+        if not task.plan:
+            logger.warning("任务没有计划，尝试创建新计划")
+            return await self.create_plan(
+                intent=task.intent or Intent(),
+                screen_analysis=current_screen,
+            )
         
         # 获取已完成的步骤
         completed_steps = [

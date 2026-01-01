@@ -27,7 +27,7 @@ class EmbeddingService:
         
         # 2. 设置 EasyLLM ID (从你的 curl 示例中提取)
         # 如果这个 ID 会变，建议也放入 config
-        self._easyllm_id = "5ViNoLlQ46rNHMftptg8Xn" 
+        self._easyllm_id = "1U9QSWfRrP7x5ecnkX1GPr" 
 
     async def initialize(self) -> None:
         """初始化服务"""

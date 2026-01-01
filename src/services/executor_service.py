@@ -205,6 +205,10 @@ class ExecutorService:
         self._input_listener: Optional[InputListener] = None
         self._context: Optional[ExecutionContext] = None
         
+        # 标记是否使用外部服务
+        self._external_vision = False
+        self._external_planner = False
+        
         # 回调函数
         self._on_step_start: Optional[Callable[[TaskStep], None]] = None
         self._on_step_complete: Optional[Callable[[TaskStep, bool], None]] = None
@@ -213,19 +217,33 @@ class ExecutorService:
         self._on_status_update: Optional[Callable[[str], None]] = None
         self._on_ask_user: Optional[Callable[[str], None]] = None  # 新增：询问用户回调
     
+    def set_vision_service(self, vision: VisionService) -> None:
+        """设置外部 Vision 服务"""
+        self._vision = vision
+        self._external_vision = True
+        logger.info("Executor已关联外部Vision服务")
+    
+    def set_planner_service(self, planner: PlannerService) -> None:
+        """设置外部 Planner 服务"""
+        self._planner = planner
+        self._external_planner = True
+        logger.info("Executor已关联外部Planner服务")
+    
     async def initialize(self):
         """初始化服务"""
-        # 初始化Vision服务
-        vl_config = VLConfig(
-            api_key=config.api.api_key,
-            model=config.api.vl_model,
-        )
-        self._vision = VisionService(vl_config)
-        await self._vision.initialize()
+        # 如果没有外部 Vision 服务，则初始化内部的
+        if not self._vision:
+            vl_config = VLConfig(
+                api_key=config.api.api_key,
+                model=config.api.vl_model,
+            )
+            self._vision = VisionService(vl_config)
+            await self._vision.initialize()
         
-        # 初始化Planner服务
-        self._planner = PlannerService()
-        await self._planner.initialize()
+        # 如果没有外部 Planner 服务，则初始化内部的
+        if not self._planner:
+            self._planner = PlannerService()
+            await self._planner.initialize()
         
         # 初始化输入监听器
         self._input_listener = InputListener()
@@ -236,9 +254,10 @@ class ExecutorService:
         """关闭服务"""
         if self._input_listener:
             self._input_listener.stop()
-        if self._vision:
+        # 只关闭内部创建的服务
+        if self._vision and not self._external_vision:
             await self._vision.close()
-        if self._planner:
+        if self._planner and not self._external_planner:
             await self._planner.close()
     
     def set_callbacks(
@@ -270,8 +289,14 @@ class ExecutorService:
         if self._on_ask_user:
             self._on_ask_user(question)
     
-    async def execute_task(self, intent: Intent) -> Task:
-        """执行任务的主入口"""
+    async def execute_task(self, intent: Intent, plan: Optional[TaskPlan] = None) -> Task:
+        """
+        执行任务的主入口
+        
+        Args:
+            intent: 用户意图
+            plan: 可选的任务计划，如果不传则内部生成
+        """
         task = Task(intent=intent)
         
         try:
@@ -297,20 +322,22 @@ class ExecutorService:
                 warnings=screen_state.warnings,
             )
             
-            # 2. 生成全局计划
-            self._notify_status("正在生成任务计划...")
-            plan = await self._planner.create_plan(
-                intent=intent,
-                screen_analysis=screen_analysis,
-            )
-            
-            if not plan.steps:
-                self._notify_status("无法生成任务计划")
-                task.status = TaskStatus.FAILED
-                return task
-            
-            task.plan = plan
-            self._notify_status(f"已生成 {len(plan.steps)} 步计划")
+            # 2. 使用外部传入的计划，或生成新计划
+            if plan and plan.steps:
+                self._notify_status(f"使用已有计划，共 {len(plan.steps)} 步")
+            else:
+                self._notify_status("正在生成任务计划...")
+                plan = await self._planner.create_plan(
+                    intent=intent,
+                    screen_analysis=screen_analysis,
+                )
+                
+                if not plan.steps:
+                    self._notify_status("无法生成任务计划")
+                    task.status = TaskStatus.FAILED
+                    return task
+                
+                self._notify_status(f"已生成 {len(plan.steps)} 步计划")
             
             # 3. 创建执行上下文
             self._context = ExecutionContext(

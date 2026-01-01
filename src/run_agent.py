@@ -10,13 +10,16 @@ from loguru import logger
 
 from .config import config
 from .models.intent import Intent, IntentType
-from .models.task import Task, TaskStatus
+from .models.task import Task, TaskStatus, TaskPlan
 from .models.session import UserProfile
+from .models.knowledge import KnowledgeGraph
 from .services.llm_service import LLMService
 from .services.vision_service import VisionService, VLConfig, ScreenAnalysis
 from .services.planner_service import PlannerService
 from .services.safety_service import SafetyService
 from .services.executor_service import ExecutorService
+from .services.embedding_service import EmbeddingService
+from .knowledge.rag_service import RAGService
 
 
 class SimpleElderlyAgent:
@@ -28,6 +31,9 @@ class SimpleElderlyAgent:
         self._planner: PlannerService = None
         self._safety: SafetyService = None
         self._executor: ExecutorService = None
+        self._embedding: EmbeddingService = None
+        self._rag: RAGService = None
+        self._knowledge_graph: KnowledgeGraph = None
         
         self._user_profile: UserProfile = None
     
@@ -61,9 +67,32 @@ class SimpleElderlyAgent:
         print("  🛡️ 初始化安全服务...")
         self._safety = SafetyService()
         
+        # 初始化 Embedding 服务
+        print("  🔢 初始化向量嵌入服务...")
+        self._embedding = EmbeddingService()
+        await self._embedding.initialize()
+        
+        # 初始化知识图谱
+        print("  📚 初始化知识图谱...")
+        self._knowledge_graph = KnowledgeGraph()
+        
+        # 初始化 RAG 服务
+        print("  🔍 初始化RAG检索服务...")
+        self._rag = RAGService()
+        await self._rag.initialize(
+            embedding_service=self._embedding,
+            knowledge_graph=self._knowledge_graph,
+        )
+        
+        # 将 RAG 服务关联到 Planner
+        self._planner.set_rag_service(self._rag)
+        
         # 初始化 Executor 服务
         print("  ⚡ 初始化执行服务...")
         self._executor = ExecutorService()
+        # 关联外部服务，避免重复初始化
+        self._executor.set_vision_service(self._vision)
+        self._executor.set_planner_service(self._planner)
         await self._executor.initialize()
         
         # 设置执行器回调
@@ -96,6 +125,8 @@ class SimpleElderlyAgent:
             await self._planner.close()
         if self._executor:
             await self._executor.close()
+        if self._embedding:
+            await self._embedding.close()
         print("服务已关闭")
     
     async def process_input(self, user_input: str) -> bool:
@@ -214,7 +245,8 @@ class SimpleElderlyAgent:
             print("\n⚡ [步骤5] 开始执行任务...")
             print("-" * 40)
             
-            task = await self._executor.execute_task(intent)
+            # 将已生成的计划传递给 Executor，避免重复规划
+            task = await self._executor.execute_task(intent, plan=plan)
             
             print("-" * 40)
             if task.status == TaskStatus.COMPLETED:
