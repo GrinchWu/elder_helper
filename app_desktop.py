@@ -3,6 +3,7 @@
 集成语音输入/输出、任务执行功能
 支持：需求录音、提问录音、重新开始流程
 """
+import os
 import sys
 import asyncio
 import threading
@@ -156,13 +157,36 @@ class ElderlyAgent:
         self._last_action_time = asyncio.get_event_loop().time()
 
     async def close(self):
-        """关闭服务"""
+        """关闭服务并清理所有异步任务"""
+        logger.info("正在停止 Agent 服务...")
+        
+        # 1. 取消特定的监控任务
         if self._idle_check_task:
             self._idle_check_task.cancel()
+            
+        # 2. 关闭所有子服务
         for svc in [self._asr, self._tts, self._llm, self._vision, 
                     self._planner, self._executor, self._embedding, self._video_extractor]:
             if svc:
-                await svc.close()
+                try:
+                    # 加个超时保护，防止某个服务的 close 卡死
+                    await asyncio.wait_for(svc.close(), timeout=2.0)
+                except Exception as e:
+                    logger.warning(f"关闭服务 {type(svc).__name__} 时出错或超时: {e}")
+
+        # 3. 【新增】取消当前 Loop 中所有未完成的任务 (防止挂起)
+        try:
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            
+            # 等待任务取消完成
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logger.warning(f"清理剩余任务时出错: {e}")
+            
+        logger.info("Agent 服务已停止")
 
     async def start_recording(self):
         """开始录音"""
@@ -752,10 +776,24 @@ class SimpleAssistantUI(QWidget):
         self._input.setPlaceholderText("输入需求或问题...")
     
     def closeEvent(self, event):
-        """关闭"""
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        """关闭窗口时，不废话，直接强制杀进程"""
+        from PyQt5.QtCore import QTimer
+        
+        # 1. 界面先接受关闭指令，让窗口消失
         event.accept()
+        
+        # 2. 尝试通知后台停止（尽人事）
+        if self._agent and self._loop:
+            try:
+                # 试图停止 loop，但不等待
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except:
+                pass
+        
+        # 3. 【最关键的一步】启动核弹倒计时
+        # 200毫秒后，不管后台有没有线程卡住（比如那个 VL API ReadError），直接终结进程
+        print("正在强制退出系统...")
+        QTimer.singleShot(100, lambda: os._exit(0))
 
 
 def main():
