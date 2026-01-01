@@ -69,65 +69,84 @@ class VideoKnowledgeExtractor:
     async def search_videos(
         self,
         query: str,
-        platform: str = "bilibili", # 推荐优先用bilibili，字幕和元数据更规范
+        platform: str = "bilibili",
         max_results: int = 5,
     ) -> list[VideoInfo]:
         """
-        真实的视频搜索实现
-        
-        :param query: 用户的问题，如 "微信怎么放大字体"
-        :param platform: 搜索目标 (bilibili, douyin, all)
-        :param max_results: 最大返回数量
+        [Plan C] 直接调用 Bilibili 官方搜索 API (最稳定，不依赖 yt-dlp 搜索指令)
         """
         logger.info(f"正在搜索视频: {query} [平台: {platform}]")
         
-        # 1. 构建搜索关键词 (利用site语法精准搜索)
-        search_query = query
-        if platform == "bilibili":
-            search_query = f"site:bilibili.com {query} 教程"
-        elif platform == "douyin":
-            search_query = f"site:douyin.com {query} 教程"
-        elif platform == "youtube":
-            search_query = f"site:youtube.com {query} tutorial"
-        else:
-            search_query = f"{query} 视频教程"
+        if platform != "bilibili":
+            logger.warning("目前仅 Bilibili 支持 API 直连搜索，其他平台返回空。")
+            return []
 
-        # 2. 使用 DuckDuckGo 搜索视频链接
-        # DDGS是同步库，建议放入线程池，但这里为了演示简洁直接调用（它速度很快）
-        # 实际生产建议 wrap_async
-        video_urls = []
+        # Bilibili Web 端搜索 API
+        api_url = "https://api.bilibili.com/x/web-interface/search/type"
+        params = {
+            "search_type": "video",
+            "keyword": query,
+            "page": 1,
+            "page_size": max_results
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Referer": "https://www.bilibili.com/"
+        }
+
+        valid_videos = []
+        
         try:
-            with DDGS() as ddgs:
-                # 搜索结果生成器
-                results = ddgs.text(search_query, region='cn-zh', max_results=max_results * 2)
-                for r in results:
-                    url = r.get('href', '')
-                    # 简单过滤，确保是视频链接
-                    if any(x in url for x in ['bilibili.com/video', 'douyin.com/video', 'youtube.com/watch']):
-                        video_urls.append(url)
-                        if len(video_urls) >= max_results:
-                            break
+            # 使用现有的 httpx client 发起请求
+            # 注意：B站 API 有时需要 Cookie，如果报错可能需要更复杂的封装
+            # 但基础搜索通常是公开的
+            resp = await self._client.get(api_url, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data['code'] != 0:
+                logger.error(f"B站 API 返回错误: {data.get('message')}")
+                return []
+
+            # 解析结果列表
+            result_list = data.get('data', {}).get('result', [])
+            if not result_list:
+                logger.warning("B站 API 返回结果为空")
+                return []
+
+            for item in result_list:
+                # B站 API 返回的数据中，标题通常带有 <em class="keyword"> 高亮标签，需要去除
+                raw_title = item.get('title', '未命名')
+                clean_title = raw_title.replace('<em class="keyword">', '').replace('</em>', '')
+                
+                # 转换时长 "02:30" -> 秒数
+                duration_str = item.get('duration', '0:0')
+                parts = duration_str.split(':')
+                duration_sec = 0
+                if len(parts) == 2:
+                    duration_sec = int(parts[0]) * 60 + int(parts[1])
+                elif len(parts) == 3:
+                    duration_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+                video = VideoInfo(
+                    video_id=item.get('bvid', ''),
+                    title=clean_title,
+                    description=item.get('description', ''),
+                    url=f"https://www.bilibili.com/video/{item.get('bvid')}",
+                    platform="bilibili",
+                    duration_seconds=duration_sec,
+                    thumbnail_url=f"https:{item.get('pic')}" if item.get('pic', '').startswith('//') else item.get('pic', ''),
+                    view_count=item.get('play', 0),
+                    # 构造给 LLM 看的文本
+                    transcript=f"视频标题: {clean_title}\n视频标签: {item.get('tag')}\n视频简介: {item.get('description')}"
+                )
+                valid_videos.append(video)
+
         except Exception as e:
-            logger.error(f"搜索引擎请求失败: {e}")
+            logger.error(f"Bilibili API 请求失败: {e}")
             return []
 
-        if not video_urls:
-            logger.warning(f"未找到关于 '{query}' 的视频链接")
-            return []
-
-        logger.debug(f"找到原始链接: {video_urls}")
-
-        # 3. 并发提取视频元数据
-        tasks = [self._fetch_metadata(url) for url in video_urls]
-        results = await asyncio.gather(*tasks)
-        
-        # 4. 过滤无效结果 (None)
-        valid_videos = [v for v in results if v is not None]
-        
-        # 按播放量排序（如果获取到的话），优先处理热门教程
-        valid_videos.sort(key=lambda x: x.view_count, reverse=True)
-        
-        logger.info(f"成功提取 {len(valid_videos)} 个有效视频信息")
+        logger.info(f"API 搜索成功，获取 {len(valid_videos)} 个结果")
         return valid_videos
 
     async def _fetch_metadata(self, url: str) -> Optional[VideoInfo]:
