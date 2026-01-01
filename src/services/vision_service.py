@@ -35,6 +35,8 @@ class VLConfig:
     model_light: str = "Qwen2.5-VL-72B-Instruct"
     # 重量级模型 - 用于精确元素定位
     model_heavy: str = "Qwen3-VL-235B-A22B-Instruct"
+    # OCR 模型 [新增]
+    model_ocr: str = "deepseek-ocr"
     # 兼容旧配置
     model: str = ""
 
@@ -98,7 +100,12 @@ class VisionService:
                 api_key=config.api.api_key,
                 model_light=config.api.vl_model_light,
                 model_heavy=config.api.vl_model_heavy,
+                
+                # 🟢 [修改这里] 确保参数名是 model_ocr，而不是 ocr_model
+                model_ocr="DeepSeek-OCR"  
             )
+        
+        self._client: Optional[httpx.AsyncClient] = None
         
         self._client: Optional[httpx.AsyncClient] = None
     
@@ -106,19 +113,63 @@ class VisionService:
         """构建API URL"""
         return f"{self._config.base_url}/chat/completions"
     
+    def _build_ocr_url(self) -> str:
+        """构建 OCR API URL [新增]"""
+        return f"{self._config.base_url}/ocr"
+    
     async def initialize(self) -> None:
         """初始化服务"""
         self._client = httpx.AsyncClient(timeout=300.0)
-        logger.info("Vision服务初始化完成（两层架构）")
-        logger.info(f"  - API URL: {self._build_api_url()}")
+        logger.info("Vision服务初始化完成（两层架构 + OCR）")
+        logger.info(f"  - VL API URL: {self._build_api_url()}")
+        logger.info(f"  - OCR API URL: {self._build_ocr_url()}")
         logger.info(f"  - 轻量模型: {self._config.model_light}")
         logger.info(f"  - 重量模型: {self._config.model_heavy}")
+        logger.info(f"  - OCR模型: {self._config.model_ocr}")
     
     async def close(self) -> None:
         """关闭服务"""
         if self._client:
             await self._client.aclose()
             self._client = None
+
+            # ==================== OCR 识别 [新增] ====================
+
+    async def extract_text_from_bytes(self, image_bytes: bytes) -> str:
+        """
+        使用 DeepSeek-OCR 模型通过 Chat 接口提取文字
+        """
+        if not self._client or not image_bytes:
+            return ""
+            
+        try:
+            # 1. 编码图片
+            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+            
+            # 2. 构造标准 Chat 消息 (符合你的 curl 结构)
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "ocr"}, # 简单的 Prompt 触发 OCR
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
+                ]
+            }]
+            
+            logger.info(f"正在调用 OCR (Model: {self._config.model_ocr})...")
+            
+            # 3. 复用 _call_vl_api (它已经处理了 URL、Header 和 Response 解析)
+            content = await self._call_vl_api(
+                messages,
+                model=self._config.model_ocr, # 使用 DeepSeek-OCR
+                max_tokens=2000
+            )
+            
+            logger.info(f"OCR 识别成功，长度: {len(content)}")
+            return content
+
+        except Exception as e:
+            logger.error(f"OCR 调用失败: {e}")
+            return ""
 
     # ==================== 通用方法 ====================
     
