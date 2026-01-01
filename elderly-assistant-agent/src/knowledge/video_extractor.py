@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from loguru import logger
+from duckduckgo_search import DDGS  # 新增：用于搜索
+import yt_dlp  # 新增：用于提取元数据
 
 from ..config import config
 from ..models.knowledge import OperationGuide, KnowledgeNode, NodeType
@@ -23,16 +28,32 @@ class VideoInfo:
     platform: str = ""  # douyin, kuaishou, bilibili
     duration_seconds: int = 0
     transcript: str = ""  # 视频字幕/转录
-    frames: list[bytes] = field(default_factory=list)  # 关键帧
+    thumbnail_url: str = "" # 新增：缩略图
+    view_count: int = 0     # 新增：播放量（用于筛选热门视频）
 
 
 class VideoKnowledgeExtractor:
     """视频知识提取器"""
-    
     def __init__(self) -> None:
-        self._llm_url = config.api.qwen_llm_url
-        self._vl_url = config.api.qwen_vl_url
+        # 1. 修正 URL 变量名 (对应你截图里的 sophnet_base_url)
+        self._llm_url = config.api.sophnet_base_url 
+        
+        # 2. 关键：读取你在配置里写好的 Qwen3 模型名
+        # 如果 config 里叫 vl_model，这里就用 vl_model
+        self._model_name = config.api.vl_model 
+        
         self._client: Optional[httpx.AsyncClient] = None
+        self._ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,  # 关键：不下载视频文件
+            'extract_flat': False,  # 需要深度解析以获取字幕
+            'writesubtitles': True, # 尝试获取字幕
+            'writeautomaticsub': True, # 尝试获取自动生成字幕
+            'subtitleslangs': ['zh-Hans', 'zh-Hant', 'zh', 'en'], # 优先中文
+        }
+        # 线程池，用于运行同步的 yt-dlp
+        self._executor = ThreadPoolExecutor(max_workers=3)
     
     async def initialize(self) -> None:
         """初始化"""
@@ -43,6 +64,143 @@ class VideoKnowledgeExtractor:
         """关闭"""
         if self._client:
             await self._client.aclose()
+        self._executor.shutdown(wait=False)
+
+    async def search_videos(
+        self,
+        query: str,
+        platform: str = "bilibili",
+        max_results: int = 5,
+    ) -> list[VideoInfo]:
+        """
+        [Plan C] 直接调用 Bilibili 官方搜索 API (最稳定，不依赖 yt-dlp 搜索指令)
+        """
+        logger.info(f"正在搜索视频: {query} [平台: {platform}]")
+        
+        if platform != "bilibili":
+            logger.warning("目前仅 Bilibili 支持 API 直连搜索，其他平台返回空。")
+            return []
+
+        # Bilibili Web 端搜索 API
+        api_url = "https://api.bilibili.com/x/web-interface/search/type"
+        params = {
+            "search_type": "video",
+            "keyword": query,
+            "page": 1,
+            "page_size": max_results
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Referer": "https://www.bilibili.com/"
+        }
+
+        valid_videos = []
+        
+        try:
+            # 使用现有的 httpx client 发起请求
+            # 注意：B站 API 有时需要 Cookie，如果报错可能需要更复杂的封装
+            # 但基础搜索通常是公开的
+            resp = await self._client.get(api_url, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data['code'] != 0:
+                logger.error(f"B站 API 返回错误: {data.get('message')}")
+                return []
+
+            # 解析结果列表
+            result_list = data.get('data', {}).get('result', [])
+            if not result_list:
+                logger.warning("B站 API 返回结果为空")
+                return []
+
+            for item in result_list:
+                # B站 API 返回的数据中，标题通常带有 <em class="keyword"> 高亮标签，需要去除
+                raw_title = item.get('title', '未命名')
+                clean_title = raw_title.replace('<em class="keyword">', '').replace('</em>', '')
+                
+                # 转换时长 "02:30" -> 秒数
+                duration_str = item.get('duration', '0:0')
+                parts = duration_str.split(':')
+                duration_sec = 0
+                if len(parts) == 2:
+                    duration_sec = int(parts[0]) * 60 + int(parts[1])
+                elif len(parts) == 3:
+                    duration_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+                video = VideoInfo(
+                    video_id=item.get('bvid', ''),
+                    title=clean_title,
+                    description=item.get('description', ''),
+                    url=f"https://www.bilibili.com/video/{item.get('bvid')}",
+                    platform="bilibili",
+                    duration_seconds=duration_sec,
+                    thumbnail_url=f"https:{item.get('pic')}" if item.get('pic', '').startswith('//') else item.get('pic', ''),
+                    view_count=item.get('play', 0),
+                    # 构造给 LLM 看的文本
+                    transcript=f"视频标题: {clean_title}\n视频标签: {item.get('tag')}\n视频简介: {item.get('description')}"
+                )
+                valid_videos.append(video)
+
+        except Exception as e:
+            logger.error(f"Bilibili API 请求失败: {e}")
+            return []
+
+        logger.info(f"API 搜索成功，获取 {len(valid_videos)} 个结果")
+        return valid_videos
+
+    async def _fetch_metadata(self, url: str) -> Optional[VideoInfo]:
+        """使用 yt-dlp 提取单个视频的详细元数据"""
+        
+        def _run_ydl():
+            try:
+                with yt_dlp.YoutubeDL(self._ydl_opts) as ydl:
+                    # extract_info 会联网获取数据
+                    info = ydl.extract_info(url, download=False)
+                    return info
+            except Exception as e:
+                logger.warning(f"yt-dlp 解析失败 [{url}]: {str(e)[:100]}")
+                return None
+
+        # 在线程池中运行同步的 yt-dlp
+        loop = asyncio.get_running_loop()
+        info = await loop.run_in_executor(self._executor, _run_ydl)
+
+        if not info:
+            return None
+
+        # 数据清洗与转换
+        try:
+            # 尝试获取字幕/说明
+            transcript = info.get('description', '')
+            
+            # 这里的逻辑是：如果没有字幕，yt-dlp 可能会把自动字幕放在 'automatic_captions'
+            # 或者我们需要依赖 description。
+            # 真实场景中，提取字幕比较复杂，这里简化为优先取 description，其次是 tags
+            if 'captions' in info and info['captions']:
+                # 这里省略了复杂的字幕下载解析逻辑，暂用描述代替
+                pass
+            
+            # B站特定优化：B站的 description 通常包含笔记
+            # 抖音特定优化：抖音 description 通常很短
+            
+            video_info = VideoInfo(
+                video_id=info.get('id', ''),
+                title=info.get('title', '未命名视频'),
+                description=info.get('description', ''),
+                url=info.get('webpage_url', url),
+                platform=info.get('extractor', 'unknown'),
+                duration_seconds=int(info.get('duration', 0)),
+                thumbnail_url=info.get('thumbnail', ''),
+                view_count=info.get('view_count', 0),
+                # 将元数据拼接到 transcript 字段，给 LLM 更多上下文
+                transcript=f"视频标题: {info.get('title')}\n视频简介: {info.get('description')}\n标签: {info.get('tags')}"
+            )
+            return video_info
+        except Exception as e:
+            logger.error(f"数据转换失败: {e}")
+            return None
+    
     
     async def extract_from_video(self, video_info: VideoInfo) -> Optional[OperationGuide]:
         """从视频提取操作指南"""
@@ -108,7 +266,7 @@ class VideoKnowledgeExtractor:
             response = await self._client.post(
                 f"{self._llm_url}/chat/completions",
                 json={
-                    "model": "qwen",
+                    "model": self._model_name,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 500,
                 },
@@ -155,7 +313,7 @@ class VideoKnowledgeExtractor:
             response = await self._client.post(
                 f"{self._llm_url}/chat/completions",
                 json={
-                    "model": "qwen",
+                    "model": self._model_name,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 1000,
                 },
@@ -205,7 +363,7 @@ class VideoKnowledgeExtractor:
             response = await self._client.post(
                 f"{self._llm_url}/chat/completions",
                 json={
-                    "model": "qwen",
+                    "model": self._model_name,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 1000,
                 },
@@ -256,7 +414,7 @@ class VideoKnowledgeExtractor:
             response = await self._client.post(
                 f"{self._llm_url}/chat/completions",
                 json={
-                    "model": "qwen",
+                    "model": self._model_name,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 800,
                 },
@@ -316,15 +474,3 @@ class VideoKnowledgeExtractor:
         
         return min(score, 1.0)
     
-    async def search_videos(
-        self,
-        query: str,
-        platform: str = "all",
-        max_results: int = 10,
-    ) -> list[VideoInfo]:
-        """搜索相关视频（需要实现具体的平台API调用）"""
-        # 这里是占位实现，实际需要调用各平台的API
-        logger.info(f"搜索视频: {query}, 平台: {platform}")
-        
-        # 返回空列表，实际实现需要调用平台API
-        return []

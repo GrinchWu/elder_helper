@@ -1,0 +1,51 @@
+# ============================================
+# 老年人电脑助手Agent - 依赖配置
+# ============================================
+# 安装方法:
+#   conda activate elder
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# ============================================
+
+# Web框架
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.5.0
+
+# HTTP/WebSocket客户端
+httpx>=0.25.0
+websockets>=12.0
+
+# 数据处理
+numpy>=1.24.0
+pillow>=10.0.0
+
+# 屏幕截图
+mss>=9.0.0
+
+# 鼠标键盘控制
+pynput>=1.7.6
+
+# 音频处理 (Windows需要先安装portaudio)
+pyaudio>=0.2.14
+
+# 图结构 (知识图谱)
+networkx>=3.2.0
+
+# 缓存
+redis>=5.0.0
+
+# 配置和日志
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+# 视频/搜索
+yt-dlp>=2024.1.0
+duckduckgo-search>=4.0.0
+
+# ============================================
+# 开发依赖 (可选)
+# ============================================
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+ruff>=0.1.0
+mypy>=1.7.0

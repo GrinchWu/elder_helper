@@ -15,12 +15,52 @@ load_dotenv()
 @dataclass(frozen=True)
 class APIConfig:
     """API端点配置"""
-    qwen_vl_url: str = field(default_factory=lambda: os.getenv("QWEN_VL_API_URL", "http://localhost:8000/v1"))
-    qwen_llm_url: str = field(default_factory=lambda: os.getenv("QWEN_LLM_API_URL", "http://localhost:8001/v1"))
-    fun_asr_url: str = field(default_factory=lambda: os.getenv("FUN_ASR_API_URL", "http://localhost:8002"))
+    # Sophnet API 配置 (OpenAI兼容格式)
+    sophnet_base_url: str = "https://www.sophnet.com/api/open-apis/v1"
+    
+    # 纯语言模型
+    llm_model: str = field(default_factory=lambda: os.getenv(
+        "LLM_MODEL", "Qwen2.5-72B-Instruct"
+    ))
+    
+    # 多模态模型 - 轻量级 (用于页面状态分析)
+    vl_model_light: str = field(default_factory=lambda: os.getenv(
+        "VL_MODEL_LIGHT", "Qwen2.5-VL-72B-Instruct"
+    ))
+    
+    # 多模态模型 - 重量级 (用于精确元素定位)
+    vl_model_heavy: str = field(default_factory=lambda: os.getenv(
+        "VL_MODEL_HEAVY", "Qwen3-VL-235B-A22B-Instruct"
+    ))
+    
+    # 兼容旧配置
+    vl_model: str = field(default_factory=lambda: os.getenv(
+        "VL_MODEL", "Qwen3-VL-235B-A22B-Instruct"
+    ))
+    
+    # 统一 API Key
+    api_key: str = field(default_factory=lambda: os.getenv(
+        "SOPHNET_API_KEY",
+        "CL9TPTG2Qro1oto8pSyBq6bQpXFCRs8g-Yl2d7nuElQBr2HtqkA19yu7wC1Zy6DGWOe4BELfLoZXUfuhD3yIoQ"
+    ))
+    
+    # 其他服务
     cosyvoice_url: str = field(default_factory=lambda: os.getenv("COSYVOICE_API_URL", "http://localhost:8003"))
     bge_m3_url: str = field(default_factory=lambda: os.getenv("BGE_M3_API_URL", "http://localhost:8004"))
-    api_key: Optional[str] = field(default_factory=lambda: os.getenv("QWEN_API_KEY"))
+
+
+@dataclass(frozen=True)
+class ASRConfig:
+    """ASR语音识别配置 - Sophnet WebSocket API"""
+    project_id: str = field(default_factory=lambda: os.getenv("ASR_PROJECT_ID", "4EygjiMQCjGljeZ8tFJlZD"))
+    easyllm_id: str = field(default_factory=lambda: os.getenv("ASR_EASYLLM_ID", "7asJ6QtG2wmknC3iBH7l4B"))
+    api_key: str = field(default_factory=lambda: os.getenv(
+        "ASR_API_KEY",
+        "CL9TPTG2Qro1oto8pSyBq6bQpXFCRs8g-Yl2d7nuElQBr2HtqkA19yu7wC1Zy6DGWOe4BELfLoZXUfuhD3yIoQ"
+    ))
+    format: str = field(default_factory=lambda: os.getenv("ASR_FORMAT", "pcm"))
+    sample_rate: int = field(default_factory=lambda: int(os.getenv("ASR_SAMPLE_RATE", "16000")))
+    heartbeat: bool = True
 
 
 @dataclass(frozen=True)
@@ -60,6 +100,7 @@ class LogConfig:
 class AppConfig:
     """应用总配置"""
     api: APIConfig = field(default_factory=APIConfig)
+    asr: ASRConfig = field(default_factory=ASRConfig)
     redis: RedisConfig = field(default_factory=RedisConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     log: LogConfig = field(default_factory=LogConfig)
