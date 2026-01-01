@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, TYPE_CHECKING
@@ -57,6 +58,7 @@ class PlannerService:
         self._base_url = config.api.sophnet_base_url
         self._api_key = config.api.api_key
         self._model = config.api.llm_model
+        self._model_fast = config.api.planner_model_fast  # 快速模型
         self._client: Optional[httpx.AsyncClient] = None
         self._knowledge_graph: Optional[KnowledgeGraph] = None
         self._rag_service: Optional["RAGService"] = None
@@ -67,7 +69,8 @@ class PlannerService:
         self._knowledge_graph = KnowledgeGraph()
         logger.info("Planner服务初始化完成")
         logger.info(f"  - API URL: {self._base_url}/chat/completions")
-        logger.info(f"  - 模型: {self._model}")
+        logger.info(f"  - 主模型: {self._model}")
+        logger.info(f"  - 快速模型: {self._model_fast}")
     
     async def close(self) -> None:
         """关闭服务"""
@@ -84,18 +87,27 @@ class PlannerService:
         self._rag_service = rag_service
         logger.info("Planner已关联RAG服务")
     
-    async def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> str:
-        """调用LLM API"""
+    async def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000, use_fast_model: bool = False) -> str:
+        """调用LLM API
+        
+        Args:
+            system_prompt: 系统提示
+            user_prompt: 用户提示
+            max_tokens: 最大token数
+            use_fast_model: 是否使用快速模型(Qwen3-14B)
+        """
         if not self._client:
             raise RuntimeError("Planner服务未初始化")
         
+        model = self._model_fast if use_fast_model else self._model
+        
         try:
-            logger.debug(f"调用LLM API: {self._base_url}/chat/completions")
+            logger.debug(f"调用LLM API: {self._base_url}/chat/completions, 模型: {model}")
             
             response = await self._client.post(
                 f"{self._base_url}/chat/completions",
                 json={
-                    "model": self._model,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -111,7 +123,35 @@ class PlannerService:
             response.raise_for_status()
             
             result = response.json()
-            content = result["choices"][0]["message"]["content"]
+            logger.debug(f"LLM API响应结构: {list(result.keys())}")
+            
+            # 兼容不同的响应格式
+            if "choices" in result and len(result["choices"]) > 0:
+                choice = result["choices"][0]
+                if "message" in choice:
+                    msg = choice["message"]
+                    # Qwen3 模型可能返回 reasoning_content 或 content
+                    if "content" in msg and msg["content"]:
+                        content = msg["content"]
+                    elif "reasoning_content" in msg and msg["reasoning_content"]:
+                        # Qwen3 的推理内容，需要从中提取有用信息
+                        content = msg["reasoning_content"]
+                    else:
+                        logger.warning(f"message中无content: {msg.keys()}")
+                        content = str(msg)
+                elif "text" in choice:
+                    content = choice["text"]
+                else:
+                    logger.error(f"未知的choice格式: {list(choice.keys())}")
+                    content = str(choice)
+            elif "content" in result:
+                content = result["content"]
+            elif "text" in result:
+                content = result["text"]
+            else:
+                logger.error(f"未知的响应格式: {result}")
+                content = str(result)
+            
             logger.debug(f"LLM响应长度: {len(content)}")
             return content
             
@@ -121,6 +161,9 @@ class PlannerService:
             raise
         except httpx.HTTPError as e:
             logger.error(f"LLM API调用失败: {type(e).__name__}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"LLM API解析失败: {type(e).__name__}: {e}")
             raise
     
     async def create_plan(
@@ -695,16 +738,125 @@ class PlannerService:
         prompt = self._build_react_prompt(context)
         
         try:
+            # 使用快速模型进行单步决策
             content = await self._call_llm(
                 system_prompt=self._get_react_system_prompt(),
                 user_prompt=prompt,
                 max_tokens=500,
+                use_fast_model=True,  # 使用Qwen3-14B快速响应
             )
             return self._parse_react_step(content)
             
         except Exception as e:
             logger.error(f"ReAct步骤生成失败: {e}")
             return ReActStep(thought="无法生成下一步", state=PlannerState.FAILED)
+    
+    async def plan_next_step(
+        self,
+        intent: Intent,
+        screen_analysis: ScreenAnalysis,
+        history: list[str] = None,
+    ) -> TaskStep:
+        """快速规划下一步操作（混合模式 - 单步规划）
+        
+        使用Qwen3-14B快速模型，目标响应时间<3s
+        使用ReAct风格的提示和解析
+        """
+        history = history or []
+        
+        # 使用ReAct风格的提示
+        prompt = f"""目标：{intent.normalized_text or intent.raw_text}
+
+当前屏幕：
+- 应用：{screen_analysis.app_name}
+- 页面：{screen_analysis.screen_type}
+- 描述：{screen_analysis.description}
+
+{"已完成步骤：" + chr(10).join(history) if history else "这是第一步"}
+
+请给出下一步的Thought和Action。"""
+
+        try:
+            content = await self._call_llm(
+                system_prompt=self._get_react_system_prompt(),
+                user_prompt=prompt,
+                max_tokens=500,
+                use_fast_model=True,  # 使用Qwen3-14B
+            )
+            
+            logger.debug(f"快速规划响应: {content[:300] if content else 'None'}")
+            
+            # 使用ReAct解析方式
+            react_step = self._parse_react_step(content)
+            
+            if react_step.action:
+                # 生成友好的操作描述（只描述动作，不包含推理过程）
+                friendly = self._generate_friendly_instruction(react_step.action)
+                
+                return TaskStep(
+                    step_number=len(history) + 1,
+                    description=f"{react_step.action.action_type.value}: {react_step.action.element_description or react_step.action.text or ''}",
+                    friendly_instruction=friendly,
+                    action=react_step.action,
+                )
+            else:
+                # 如果没有解析出动作，尝试从thought中提取简短描述
+                logger.warning(f"未能解析出动作，thought: {react_step.thought[:100] if react_step.thought else 'None'}")
+                # 返回一个等待动作，让用户确认
+                return TaskStep(
+                    step_number=len(history) + 1,
+                    description="等待确认",
+                    friendly_instruction="请告诉我您想做什么",
+                    action=Action(action_type=ActionType.WAIT, wait_ms=3000),
+                )
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"快速规划HTTP错误: {e.response.status_code} - {e.response.text[:200]}")
+        except Exception as e:
+            logger.error(f"快速规划失败: {type(e).__name__}: {e}")
+        
+        # 返回默认完成步骤
+        return TaskStep(
+            step_number=1,
+            description="完成",
+            friendly_instruction="无法确定下一步操作",
+            action=Action(action_type=ActionType.DONE),
+        )
+    
+    def _generate_friendly_instruction(self, action: Action) -> str:
+        """根据动作生成友好的操作描述（只描述动作本身）"""
+        action_type = action.action_type
+        target = action.element_description or ""
+        text = action.text or ""
+        key = action.key or ""
+        hotkey = action.hotkey or ""
+        
+        if action_type == ActionType.CLICK:
+            return f"请点击{target}" if target else "请点击目标"
+        elif action_type == ActionType.DOUBLE_CLICK:
+            return f"请双击{target}" if target else "请双击目标"
+        elif action_type == ActionType.RIGHT_CLICK:
+            return f"请右键点击{target}" if target else "请右键点击目标"
+        elif action_type == ActionType.TYPE:
+            return f'请输入"{text}"' if text else "请输入内容"
+        elif action_type == ActionType.KEY_PRESS:
+            return f"请按{key}键" if key else "请按键"
+        elif action_type == ActionType.HOTKEY:
+            return f"请按组合键{hotkey}" if hotkey else "请按组合键"
+        elif action_type == ActionType.SCROLL:
+            direction = action.scroll_direction or "down"
+            dir_text = "向上" if direction == "up" else "向下"
+            return f"请{dir_text}滚动{target}" if target else f"请{dir_text}滚动"
+        elif action_type == ActionType.DRAG:
+            return f"请拖动{target}" if target else "请拖动"
+        elif action_type == ActionType.WAIT:
+            return "请稍等"
+        elif action_type == ActionType.WAIT_ELEMENT:
+            return f"请等待{target}出现" if target else "请等待"
+        elif action_type == ActionType.DONE:
+            return "任务已完成"
+        else:
+            return f"请执行{action_type.value}操作"
     
     def _get_react_system_prompt(self) -> str:
         """ReAct系统提示（使用标准化 Skill Set）"""
@@ -776,10 +928,15 @@ Action: 完成"""
         return "\n".join(parts)
     
     def _parse_react_step(self, content: str) -> ReActStep:
-        """解析ReAct步骤"""
+        """解析ReAct步骤 - 支持从reasoning_content中提取"""
         step = ReActStep()
         
+        if not content:
+            return step
+        
         lines = content.strip().split("\n")
+        
+        # 先尝试标准格式解析
         for line in lines:
             line = line.strip()
             if line.lower().startswith("thought:"):
@@ -789,8 +946,65 @@ Action: 完成"""
                 step.action = self._parse_react_action_string(action_str)
                 step.state = PlannerState.ACTING
         
-        if not step.thought:
-            step.thought = content
+        # 如果没有解析出action，尝试从内容中提取关键操作
+        if not step.action:
+            import re
+            
+            # 优先查找标准格式的动作（技能集中的12种操作）
+            skill_patterns = [
+                (r'单击[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.CLICK),
+                (r'双击[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.DOUBLE_CLICK),
+                (r'右键单击[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.RIGHT_CLICK),
+                (r'输入[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.TYPE),
+                (r'按下[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.KEY_PRESS),
+                (r'组合键[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.HOTKEY),
+                (r'向上滚动[：:\s]*[「"\'【]?([^」"\'】\n，。]*)[」"\'】]?', ActionType.SCROLL),
+                (r'向下滚动[：:\s]*[「"\'【]?([^」"\'】\n，。]*)[」"\'】]?', ActionType.SCROLL),
+                (r'等待[：:\s]*(\d+)', ActionType.WAIT),
+                (r'完成', ActionType.DONE),
+            ]
+            
+            for pattern, action_type in skill_patterns:
+                match = re.search(pattern, content)
+                if match:
+                    target = match.group(1).strip() if match.lastindex and match.group(1) else ""
+                    
+                    step.action = Action(action_type=action_type)
+                    
+                    if action_type == ActionType.TYPE:
+                        step.action.text = target
+                    elif action_type == ActionType.KEY_PRESS:
+                        step.action.key = target
+                    elif action_type == ActionType.HOTKEY:
+                        step.action.hotkey = target
+                    elif action_type == ActionType.SCROLL:
+                        step.action.scroll_direction = "up" if "向上" in pattern else "down"
+                        step.action.element_description = target
+                    elif action_type == ActionType.WAIT:
+                        try:
+                            step.action.wait_ms = int(target) * 1000
+                        except:
+                            step.action.wait_ms = 3000
+                    elif action_type in (ActionType.CLICK, ActionType.DOUBLE_CLICK, ActionType.RIGHT_CLICK):
+                        step.action.element_description = target
+                    
+                    step.thought = f"{action_type.value}: {target}"
+                    step.state = PlannerState.ACTING
+                    break
+            
+            # 如果还是没有，检查是否提到任务完成
+            if not step.action:
+                if any(kw in content for kw in ["已完成", "完成了", "任务完成", "不需要", "无需"]):
+                    step.action = Action(action_type=ActionType.DONE)
+                    step.thought = "任务已完成"
+                    step.state = PlannerState.COMPLETED
+        
+        # 设置简短的thought（不超过50字符）
+        if not step.thought or len(step.thought) > 50:
+            if step.action:
+                step.thought = f"{step.action.action_type.value}"
+            else:
+                step.thought = "分析中"
         
         return step
     

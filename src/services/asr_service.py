@@ -314,11 +314,13 @@ class AudioCapture:
         self._is_capturing = False
         self._audio = None
         self._stream = None
+        self._audio_buffer = []  # 存储录音数据
     
     def start(self) -> None:
         """开始采集"""
         try:
             import pyaudio
+            self._audio_buffer = []  # 清空缓冲区
             self._audio = pyaudio.PyAudio()
             self._stream = self._audio.open(
                 format=pyaudio.paInt16,
@@ -326,12 +328,25 @@ class AudioCapture:
                 rate=self._sample_rate,
                 input=True,
                 frames_per_buffer=self._chunk_size // 2,  # 16bit = 2 bytes per sample
+                stream_callback=self._audio_callback,  # 使用回调模式
             )
+            self._stream.start_stream()
             self._is_capturing = True
             logger.info(f"音频采集已启动 (采样率: {self._sample_rate}Hz)")
         except Exception as e:
             logger.error(f"启动音频采集失败: {e}")
             raise
+    
+    def _audio_callback(self, in_data, frame_count, time_info, status):
+        """音频回调函数"""
+        import pyaudio
+        if self._is_capturing:
+            self._audio_buffer.append(in_data)
+        return (None, pyaudio.paContinue)
+    
+    def get_all_audio(self) -> bytes:
+        """获取所有录制的音频数据"""
+        return b"".join(self._audio_buffer)
     
     def stop(self) -> None:
         """停止采集"""

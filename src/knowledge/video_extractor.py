@@ -473,4 +473,309 @@ class VideoKnowledgeExtractor:
             score += 0.2
         
         return min(score, 1.0)
+
+    # ============ 知识库构建功能 ============
+    
+    @staticmethod
+    def get_common_operation_queries() -> list[dict]:
+        """获取10种常见计算机基本操作的搜索关键词（面向初级用户）"""
+        return [
+            {"query": "电脑新手如何打开浏览器上网", "app": "浏览器", "feature": "打开浏览器"},
+            {"query": "老年人微信发消息教程", "app": "微信", "feature": "发送消息"},
+            {"query": "电脑如何复制粘贴文字", "app": "系统", "feature": "复制粘贴"},
+            {"query": "新手如何用电脑看新闻", "app": "浏览器", "feature": "浏览网页"},
+            {"query": "微信视频通话怎么打", "app": "微信", "feature": "视频通话"},
+            {"query": "电脑如何调节音量大小", "app": "系统", "feature": "调节音量"},
+            {"query": "如何用电脑打字输入法", "app": "输入法", "feature": "打字输入"},
+            {"query": "电脑如何连接wifi无线网", "app": "系统", "feature": "连接WiFi"},
+            {"query": "微信如何发送图片照片", "app": "微信", "feature": "发送图片"},
+            {"query": "电脑如何关机重启", "app": "系统", "feature": "关机重启"},
+        ]
+    
+    async def build_knowledge_base(
+        self,
+        rag_service,
+        max_videos_per_query: int = 2,
+        use_llm_extract: bool = False,
+    ) -> dict:
+        """
+        从B站搜索常见操作视频，构建知识库
+        
+        Args:
+            rag_service: RAGService实例，用于索引知识
+            max_videos_per_query: 每个查询最多处理的视频数
+            use_llm_extract: 是否使用LLM提取详细步骤（较慢但更准确）
+        
+        Returns:
+            构建统计信息
+        """
+        if not self._client:
+            await self.initialize()
+        
+        queries = self.get_common_operation_queries()
+        stats = {
+            "total_queries": len(queries),
+            "videos_found": 0,
+            "guides_created": 0,
+            "nodes_created": 0,
+            "errors": []
+        }
+        
+        logger.info(f"开始构建知识库，共 {len(queries)} 个查询...")
+        
+        for i, q in enumerate(queries):
+            query = q["query"]
+            app_name = q["app"]
+            feature_name = q["feature"]
+            
+            logger.info(f"[{i+1}/{len(queries)}] 搜索: {query}")
+            
+            try:
+                # 搜索视频
+                videos = await self.search_videos(query, max_results=max_videos_per_query)
+                stats["videos_found"] += len(videos)
+                
+                if not videos:
+                    logger.warning(f"  未找到视频: {query}")
+                    continue
+                
+                for video in videos:
+                    try:
+                        if use_llm_extract:
+                            # 使用LLM提取详细步骤（较慢）
+                            guide = await self.extract_from_video(video)
+                        else:
+                            # 快速模式：直接从视频元数据构建指南
+                            guide = self._quick_build_guide(video, app_name, feature_name)
+                        
+                        if guide:
+                            await rag_service.index_guide(guide)
+                            stats["guides_created"] += 1
+                            logger.info(f"  ✅ 已索引: {guide.title[:30]}...")
+                    
+                    except Exception as e:
+                        logger.warning(f"  处理视频失败: {e}")
+                        stats["errors"].append(str(e))
+                
+                # 为每个应用/功能创建知识节点
+                node = KnowledgeNode(
+                    id=uuid4(),
+                    node_type=NodeType.FEATURE,
+                    name=f"{app_name}-{feature_name}",
+                    description=f"如何在{app_name}中{feature_name}",
+                    aliases=[query, feature_name, f"{app_name}{feature_name}"],
+                )
+                await rag_service.index_node(node)
+                stats["nodes_created"] += 1
+                
+            except Exception as e:
+                logger.error(f"查询失败 [{query}]: {e}")
+                stats["errors"].append(f"{query}: {e}")
+            
+            # 避免请求过快
+            await asyncio.sleep(0.5)
+        
+        logger.info(f"知识库构建完成: {stats['guides_created']} 条指南, {stats['nodes_created']} 个节点")
+        return stats
+    
+    def _quick_build_guide(
+        self,
+        video: VideoInfo,
+        app_name: str,
+        feature_name: str,
+    ) -> OperationGuide:
+        """快速构建操作指南（不调用LLM，直接从视频元数据生成）"""
+        # 从标题和描述中提取简单步骤
+        steps = self._extract_simple_steps(video.title, video.description)
+        
+        return OperationGuide(
+            id=uuid4(),
+            title=video.title,
+            app_name=app_name,
+            feature_name=feature_name,
+            steps=steps,
+            friendly_steps=steps,  # 快速模式下相同
+            faq={},
+            source_video_id=video.video_id,
+            source_url=video.url,
+            quality_score=0.6,  # 快速模式默认分数
+        )
+    
+    def _extract_simple_steps(self, title: str, description: str) -> list[str]:
+        """从标题和描述中提取简单步骤"""
+        steps = []
+        
+        # 尝试从描述中提取步骤
+        if description:
+            lines = description.split('\n')
+            for line in lines:
+                line = line.strip()
+                # 匹配数字开头或特定格式的步骤
+                if line and (
+                    line[0].isdigit() or 
+                    line.startswith('第') or 
+                    line.startswith('步骤') or
+                    line.startswith('-') or
+                    line.startswith('•')
+                ):
+                    step = line.lstrip('0123456789.-•步骤第： ').strip()
+                    if step and len(step) > 2:
+                        steps.append(step)
+        
+        # 如果没有提取到步骤，从标题生成基本步骤
+        if not steps:
+            steps = [
+                f"打开{title.split('如何')[-1] if '如何' in title else title}",
+                "按照视频教程操作",
+                "完成操作"
+            ]
+        
+        return steps[:10]  # 最多10个步骤
+    
+    async def build_knowledge_base_with_fallback(
+        self,
+        rag_service,
+    ) -> dict:
+        """
+        构建知识库（带预置数据回退）
+        如果B站搜索失败，使用预置的示例数据
+        """
+        # 先尝试从B站搜索
+        stats = await self.build_knowledge_base(rag_service, max_videos_per_query=2)
+        
+        # 如果没有成功创建任何指南，使用预置数据
+        if stats["guides_created"] == 0:
+            logger.warning("B站搜索失败，使用预置示例数据...")
+            await self._load_preset_knowledge(rag_service)
+            stats["guides_created"] = 10
+            stats["nodes_created"] = 5
+            stats["fallback_used"] = True
+        
+        return stats
+    
+    async def _load_preset_knowledge(self, rag_service) -> None:
+        """加载预置的示例知识数据"""
+        preset_guides = [
+            OperationGuide(
+                id=uuid4(),
+                title="如何打开浏览器上网",
+                app_name="浏览器",
+                feature_name="打开浏览器",
+                steps=["找到浏览器图标", "双击打开", "在地址栏输入网址", "按回车访问"],
+                friendly_steps=["在桌面找到蓝色的e图标或圆形彩色图标", "用鼠标快速点两下打开", "在最上面的长条框里输入网址", "按键盘上的回车键"],
+                faq={"找不到浏览器": "在桌面或开始菜单找蓝色e图标"},
+                quality_score=0.9
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="微信如何发送消息",
+                app_name="微信",
+                feature_name="发送消息",
+                steps=["打开微信", "选择联系人", "输入消息", "点击发送"],
+                friendly_steps=["点开绿色的微信图标", "找到要聊天的人点进去", "在下面的框里打字", "点右边的发送按钮"],
+                faq={"找不到联系人": "在最上面的搜索框输入名字查找"},
+                quality_score=0.9
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="电脑如何复制粘贴",
+                app_name="系统",
+                feature_name="复制粘贴",
+                steps=["选中要复制的内容", "按Ctrl+C复制", "到目标位置", "按Ctrl+V粘贴"],
+                friendly_steps=["用鼠标拖动选中文字（会变蓝色）", "同时按住Ctrl键和C键", "点击要粘贴的位置", "同时按住Ctrl键和V键"],
+                faq={"复制不了": "确保先选中内容再复制"},
+                quality_score=0.9
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="如何用浏览器看新闻",
+                app_name="浏览器",
+                feature_name="浏览网页",
+                steps=["打开浏览器", "输入新闻网址", "浏览新闻列表", "点击感兴趣的新闻"],
+                friendly_steps=["双击浏览器图标打开", "在地址栏输入www.people.com.cn", "看到新闻列表", "点击想看的新闻标题"],
+                faq={"网页打不开": "检查网络连接是否正常"},
+                quality_score=0.9
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="微信视频通话教程",
+                app_name="微信",
+                feature_name="视频通话",
+                steps=["打开微信", "进入聊天", "点击加号", "选择视频通话"],
+                friendly_steps=["打开绿色微信", "点开要通话的人", "点右下角的加号", "点视频通话图标"],
+                faq={"对方看不到我": "检查摄像头是否被遮挡"},
+                quality_score=0.85
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="电脑调节音量",
+                app_name="系统",
+                feature_name="调节音量",
+                steps=["找到音量图标", "点击音量图标", "拖动滑块调节"],
+                friendly_steps=["在屏幕右下角找到喇叭图标", "点一下喇叭图标", "上下拖动调节声音大小"],
+                faq={"没有声音": "检查是否静音了，喇叭上有x表示静音"},
+                quality_score=0.9
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="电脑打字输入法",
+                app_name="输入法",
+                feature_name="打字输入",
+                steps=["点击输入框", "切换输入法", "输入拼音", "选择汉字"],
+                friendly_steps=["点击要打字的地方", "按Ctrl+空格切换中英文", "用键盘打拼音", "按数字键选择汉字"],
+                faq={"打不出中文": "按Ctrl+空格切换到中文输入法"},
+                quality_score=0.85
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="电脑连接WiFi",
+                app_name="系统",
+                feature_name="连接WiFi",
+                steps=["点击网络图标", "选择WiFi", "输入密码", "点击连接"],
+                friendly_steps=["点右下角的网络图标", "找到家里的WiFi名称点击", "输入WiFi密码", "点连接按钮"],
+                faq={"连不上WiFi": "确认密码是否正确，WiFi是否开启"},
+                quality_score=0.9
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="微信发送图片",
+                app_name="微信",
+                feature_name="发送图片",
+                steps=["打开聊天", "点击加号", "选择相册", "选择图片发送"],
+                friendly_steps=["进入聊天界面", "点右下角加号", "点相册图标", "选择图片后点发送"],
+                faq={"找不到图片": "图片在相册里，点相册图标查看"},
+                quality_score=0.9
+            ),
+            OperationGuide(
+                id=uuid4(),
+                title="电脑关机重启",
+                app_name="系统",
+                feature_name="关机重启",
+                steps=["点击开始菜单", "点击电源按钮", "选择关机或重启"],
+                friendly_steps=["点屏幕左下角的开始按钮", "点电源图标", "选择关机或重新启动"],
+                faq={"关不了机": "长按电源键5秒强制关机"},
+                quality_score=0.9
+            ),
+        ]
+        
+        preset_nodes = [
+            KnowledgeNode(id=uuid4(), node_type=NodeType.APP, name="浏览器",
+                         description="用于上网、看新闻、搜索信息", aliases=["上网", "网页", "IE", "Chrome", "Edge"]),
+            KnowledgeNode(id=uuid4(), node_type=NodeType.APP, name="微信",
+                         description="聊天、发消息、视频通话", aliases=["WeChat", "绿色的", "聊天"]),
+            KnowledgeNode(id=uuid4(), node_type=NodeType.APP, name="系统",
+                         description="电脑基本操作", aliases=["Windows", "电脑", "桌面"]),
+            KnowledgeNode(id=uuid4(), node_type=NodeType.CONCEPT, name="新闻",
+                         description="查看资讯新闻", aliases=["看新闻", "新闻网站", "人民网"]),
+            KnowledgeNode(id=uuid4(), node_type=NodeType.CONCEPT, name="输入法",
+                         description="打字输入中文", aliases=["打字", "拼音", "中文输入"]),
+        ]
+        
+        for guide in preset_guides:
+            await rag_service.index_guide(guide)
+            logger.info(f"  ✅ 预置指南: {guide.title}")
+        
+        for node in preset_nodes:
+            await rag_service.index_node(node)
+            logger.info(f"  ✅ 预置节点: {node.name}")
     
