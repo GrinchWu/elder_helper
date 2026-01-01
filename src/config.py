@@ -23,9 +23,19 @@ class APIConfig:
         "LLM_MODEL", "Qwen2.5-72B-Instruct"
     ))
     
-    # 多模态模型 (Qwen-VL)
+    # 多模态模型 - 轻量级 (用于页面状态分析)
+    vl_model_light: str = field(default_factory=lambda: os.getenv(
+        "VL_MODEL_LIGHT", "Qwen2.5-VL-72B-Instruct"
+    ))
+    
+    # 多模态模型 - 重量级 (用于精确元素定位)
+    vl_model_heavy: str = field(default_factory=lambda: os.getenv(
+        "VL_MODEL_HEAVY", "Qwen3-VL-235B-A22B-Instruct"
+    ))
+    
+    # 兼容旧配置
     vl_model: str = field(default_factory=lambda: os.getenv(
-        "VL_MODEL", "Qwen2.5-VL-72B-Instruct"
+        "VL_MODEL", "Qwen3-VL-235B-A22B-Instruct"
     ))
     
     # 统一 API Key

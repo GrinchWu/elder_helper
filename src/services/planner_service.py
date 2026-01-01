@@ -51,15 +51,19 @@ class PlannerService:
     """任务规划服务 - 使用ReAct模式"""
     
     def __init__(self) -> None:
-        self._api_url = config.api.qwen_llm_url
+        self._base_url = config.api.sophnet_base_url
+        self._api_key = config.api.api_key
+        self._model = config.api.llm_model
         self._client: Optional[httpx.AsyncClient] = None
         self._knowledge_graph: Optional[KnowledgeGraph] = None
     
     async def initialize(self) -> None:
         """初始化服务"""
-        self._client = httpx.AsyncClient(timeout=60.0)
+        self._client = httpx.AsyncClient(timeout=120.0)
         self._knowledge_graph = KnowledgeGraph()
         logger.info("Planner服务初始化完成")
+        logger.info(f"  - API URL: {self._base_url}/chat/completions")
+        logger.info(f"  - 模型: {self._model}")
     
     async def close(self) -> None:
         """关闭服务"""
@@ -71,15 +75,51 @@ class PlannerService:
         """设置知识图谱"""
         self._knowledge_graph = kg
     
+    async def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> str:
+        """调用LLM API"""
+        if not self._client:
+            raise RuntimeError("Planner服务未初始化")
+        
+        try:
+            logger.debug(f"调用LLM API: {self._base_url}/chat/completions")
+            
+            response = await self._client.post(
+                f"{self._base_url}/chat/completions",
+                json={
+                    "model": self._model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.3,
+                },
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            logger.debug(f"LLM响应长度: {len(content)}")
+            return content
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"LLM API HTTP错误: {e.response.status_code}")
+            logger.error(f"响应内容: {e.response.text}")
+            raise
+        except httpx.HTTPError as e:
+            logger.error(f"LLM API调用失败: {type(e).__name__}: {e}")
+            raise
+    
     async def create_plan(
         self,
         intent: Intent,
         screen_analysis: Optional[ScreenAnalysis] = None,
     ) -> TaskPlan:
         """创建任务计划"""
-        if not self._client:
-            raise RuntimeError("Planner服务未初始化")
-        
         # 获取相关知识
         knowledge_context = await self._get_relevant_knowledge(intent)
         
@@ -91,27 +131,14 @@ class PlannerService:
         )
         
         try:
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen",
-                    "messages": [
-                        {"role": "system", "content": self._get_system_prompt()},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 2000,
-                    "temperature": 0.3,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
+            content = await self._call_llm(
+                system_prompt=self._get_system_prompt(),
+                user_prompt=prompt,
+                max_tokens=2000,
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
             return self._parse_plan(content, intent)
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"创建计划失败: {e}")
             return TaskPlan(intent=intent)
     
@@ -161,13 +188,15 @@ class PlannerService:
         if screen_analysis:
             parts.append(f"\n当前屏幕：{screen_analysis.description}")
             parts.append(f"当前应用：{screen_analysis.app_name}")
+            parts.append(f"页面类型：{screen_analysis.screen_type}")
             
-            if screen_analysis.elements:
-                elements_desc = [
-                    f"- {e.description or e.text}"
-                    for e in screen_analysis.elements[:10]
-                ]
-                parts.append(f"可见元素：\n" + "\n".join(elements_desc))
+            # 使用建议的操作
+            if screen_analysis.suggested_actions:
+                parts.append(f"建议操作：{', '.join(screen_analysis.suggested_actions)}")
+            
+            # 如果有警告，提醒规划器
+            if screen_analysis.warnings:
+                parts.append(f"⚠️ 注意：{', '.join(screen_analysis.warnings)}")
         
         if knowledge_context:
             parts.append(f"\n参考知识：\n{knowledge_context}")
@@ -306,27 +335,14 @@ class PlannerService:
 如果需要回退，请先说明如何回退到安全状态。"""
         
         try:
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen",
-                    "messages": [
-                        {"role": "system", "content": self._get_system_prompt()},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 2000,
-                    "temperature": 0.3,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
+            content = await self._call_llm(
+                system_prompt=self._get_system_prompt(),
+                user_prompt=prompt,
+                max_tokens=2000,
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
             return self._parse_plan(content, task.intent or Intent())
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"重新规划失败: {e}")
             return TaskPlan()
     
@@ -345,34 +361,18 @@ class PlannerService:
         context: PlannerContext,
     ) -> ReActStep:
         """ReAct模式：建议下一步动作"""
-        if not self._client:
-            raise RuntimeError("Planner服务未初始化")
-        
         # 构建ReAct提示
         prompt = self._build_react_prompt(context)
         
         try:
-            response = await self._client.post(
-                f"{self._api_url}/chat/completions",
-                json={
-                    "model": "qwen",
-                    "messages": [
-                        {"role": "system", "content": self._get_react_system_prompt()},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": 500,
-                    "temperature": 0.3,
-                },
-                headers={"Authorization": f"Bearer {config.api.api_key}"} if config.api.api_key else {},
+            content = await self._call_llm(
+                system_prompt=self._get_react_system_prompt(),
+                user_prompt=prompt,
+                max_tokens=500,
             )
-            response.raise_for_status()
-            
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            
             return self._parse_react_step(content)
             
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error(f"ReAct步骤生成失败: {e}")
             return ReActStep(thought="无法生成下一步", state=PlannerState.FAILED)
     

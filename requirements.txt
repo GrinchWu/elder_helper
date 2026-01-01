@@ -13,6 +13,7 @@ pydantic>=2.5.0
 
 # HTTP/WebSocket客户端
 httpx>=0.25.0
+pynput>=1.7.6
 websockets>=12.0
 
 # 数据处理
