@@ -23,6 +23,11 @@ class APIConfig:
         "LLM_MODEL", "Qwen2.5-72B-Instruct"
     ))
     
+    # 快速规划模型 (用于ReAct循环中的快速决策)
+    planner_model_fast: str = field(default_factory=lambda: os.getenv(
+        "PLANNER_MODEL_FAST", "Qwen3-14B"
+    ))
+    
     # 多模态模型 - 轻量级 (用于页面状态分析)
     vl_model_light: str = field(default_factory=lambda: os.getenv(
         "VL_MODEL_LIGHT", "Qwen2.5-VL-72B-Instruct"
