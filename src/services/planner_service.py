@@ -193,7 +193,66 @@ class PlannerService:
         except Exception as e:
             logger.error(f"创建计划失败: {e}")
             return TaskPlan(intent=intent)
-    
+        
+        
+    async def generate_full_plan(
+        self,
+        intent: Intent,
+        screen_analysis: ScreenAnalysis,
+        history: list[str] = None
+    ) -> list[TaskStep]:
+        """
+        [Plan-and-Solve模式] 一次性生成所有步骤
+        
+        Args:
+            intent: 用户意图
+            screen_analysis: 当前屏幕分析
+            history: 执行历史（用于失败重试）
+        
+        Returns:
+            list[TaskStep]: 步骤列表
+        """
+        # 1. 获取RAG知识上下文
+        knowledge_context = await self._get_relevant_knowledge(intent)
+        
+        # 2. 构建包含历史记录的 Prompt
+        # 注意：这里调用了刚才修改过的 _build_planning_prompt
+        prompt = self._build_planning_prompt(
+            intent=intent,
+            screen_analysis=screen_analysis,
+            knowledge_context=knowledge_context,
+            history=history
+        )
+        
+        try:
+            logger.info("正在生成全量计划...")
+            
+            # 3. 调用聪明模型 (use_fast_model=False)
+            # 全量规划需要更强的推理能力，不建议用 fast 模型
+            content = await self._call_llm(
+                system_prompt=self._get_system_prompt(), # 复用现有的System Prompt，它已经定义了JSON格式和技能集
+                user_prompt=prompt,
+                max_tokens=2000,
+                use_fast_model=False 
+            )
+            
+            # 4. 复用现有的解析逻辑
+            # _parse_plan 会返回 TaskPlan 对象
+            plan = self._parse_plan(content, intent)
+            
+            if not plan.steps:
+                logger.warning("模型返回了空计划")
+                return []
+                
+            return plan.steps
+            
+        except Exception as e:
+            logger.error(f"生成全量计划失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+        
+
     def _get_system_prompt(self) -> str:
         """获取系统提示（使用标准化 Skill Set）"""
         return """你是一个帮助老年人操作电脑的AI规划器。
@@ -403,6 +462,7 @@ class PlannerService:
         intent: Intent,
         screen_analysis: Optional[ScreenAnalysis],
         knowledge_context: str,
+        history: list[str] = None,  # <--- 新增参数
     ) -> str:
         """构建规划提示"""
         parts = [f"用户想要：{intent.normalized_text or intent.raw_text}"]
@@ -413,6 +473,16 @@ class PlannerService:
         if intent.target_contact:
             parts.append(f"目标联系人：{intent.target_contact}")
         
+        # --- 新增：插入历史记录，这对于重规划至关重要 ---
+        if history:
+            parts.append(f"\n═══════════════════════════════════════")
+            parts.append(f"【已执行的历史与结果】(请根据此调整计划)")
+            parts.append(f"═══════════════════════════════════════")
+            for item in history:
+                parts.append(f"- {item}")
+            parts.append(f"⚠️ 注意：之前的步骤可能失败了，请分析原因并尝试不同的路径。")
+        # -----------------------------------------------
+
         if screen_analysis:
             parts.append(f"\n═══════════════════════════════════════")
             parts.append(f"【当前屏幕状态 - 请仔细阅读】")
@@ -442,7 +512,7 @@ class PlannerService:
         if knowledge_context:
             parts.append(f"\n参考知识：\n{knowledge_context}")
         
-        parts.append("\n请根据【当前屏幕状态】生成操作步骤计划。")
+        parts.append("\n请根据【当前屏幕状态】一次性生成完整的操作步骤计划。")
         parts.append("如果任务已经完成或当前屏幕已经是目标状态，请返回 skill_type='完成' 的步骤。")
         
         return "\n".join(parts)
