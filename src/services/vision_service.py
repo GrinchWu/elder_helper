@@ -50,6 +50,10 @@ class ScreenStateAnalysis:
     element_locations: dict[str, str] = field(default_factory=dict)  # 元素大致位置描述
     suggested_action: str = ""                  # 建议的下一步操作
     warnings: list[str] = field(default_factory=list)  # 警告信息
+    # 新增字段
+    is_desktop: bool = False                    # 是否是桌面
+    has_open_window: bool = False               # 是否有打开的窗口
+    foreground_app: str = ""                    # 当前最前面的应用
 
 
 @dataclass
@@ -278,13 +282,21 @@ class VisionService:
     
     def _build_state_analysis_prompt(self, user_intent: str) -> str:
         """构建页面状态分析提示词"""
-        prompt = """分析这个屏幕截图，描述当前页面状态。只返回JSON，不要其他文字。
+        prompt = """分析这个屏幕截图，准确描述当前页面状态。只返回JSON，不要其他文字。
+
+【重要】你必须准确识别当前屏幕显示的是什么：
+- 如果是 Windows 桌面（显示桌面图标、任务栏、壁纸），app_name 应该是 "Windows桌面"
+- 如果是某个应用程序窗口，app_name 应该是该应用的名称
+- 如果是浏览器，要区分是浏览器本身还是网页内容
 
 格式：
 {
-  "app_name": "应用名称（如：微信、Chrome浏览器、系统设置）",
-  "screen_state": "页面状态简述（如：聊天界面、登录页面、主页）",
+  "app_name": "应用名称（如：Windows桌面、微信、Chrome浏览器、文件资源管理器、系统设置）",
+  "screen_state": "页面状态简述（如：桌面、聊天界面、登录页面、主页、文件列表）",
   "page_status": "normal/loading/error/dialog/login",
+  "is_desktop": true或false,
+  "has_open_window": true或false,
+  "foreground_app": "当前最前面的应用名称，如果是桌面则为空",
   "description": "用简单语言描述当前屏幕显示的内容，适合老年人理解",
   "available_elements": ["元素1名称", "元素2名称", "..."],
   "element_locations": {
@@ -294,13 +306,19 @@ class VisionService:
   "warnings": ["如果有安全风险或异常，在这里提醒"]
 }
 
+【判断规则】
+1. 如果看到桌面壁纸和桌面图标，is_desktop = true
+2. 如果有应用窗口覆盖在桌面上，has_open_window = true
+3. 如果是全屏应用或最大化窗口，is_desktop = false
+4. foreground_app 是当前用户正在操作的应用
+
 注意：
 1. 不需要返回精确坐标，只需要描述元素的大致位置
 2. available_elements 只列出可交互的元素（按钮、输入框、链接等）
 3. 用老年人能理解的语言描述"""
         
         if user_intent:
-            prompt += f"\n\n用户想要：{user_intent}\n请重点关注与用户意图相关的元素。"
+            prompt += f"\n\n用户想要：{user_intent}\n请重点关注与用户意图相关的元素，并判断当前屏幕状态是否已经满足用户需求。"
         
         return prompt
     
@@ -331,6 +349,9 @@ class VisionService:
                     element_locations=data.get("element_locations", {}),
                     suggested_action=data.get("suggested_action", ""),
                     warnings=data.get("warnings", []),
+                    is_desktop=data.get("is_desktop", False),
+                    has_open_window=data.get("has_open_window", False),
+                    foreground_app=data.get("foreground_app", ""),
                 )
         except Exception as e:
             logger.warning(f"解析页面状态失败: {e}")

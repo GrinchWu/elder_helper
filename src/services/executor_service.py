@@ -391,6 +391,15 @@ class ExecutorService:
                 if self._on_step_start:
                     self._on_step_start(step)
                 
+                # 检查是否是 "完成" 动作类型 - 直接标记任务完成，无需等待用户输入
+                if step.action and step.action.action_type == ActionType.DONE:
+                    self._notify_status("🎉 任务已完成，无需更多操作！")
+                    self._context.step_status = StepStatus.SUCCESS
+                    self._context.current_step_index = len(self._context.plan.steps)  # 跳到最后
+                    if self._on_task_complete:
+                        self._on_task_complete(self._context.task, True)
+                    break
+                
                 # 设置状态为等待用户
                 self._context.step_status = StepStatus.WAITING_USER
                 self._notify_status("⏳ 等待您完成操作...")

@@ -52,8 +52,8 @@ class APIConfig:
 @dataclass(frozen=True)
 class ASRConfig:
     """ASR语音识别配置 - Sophnet WebSocket API"""
-    project_id: str = field(default_factory=lambda: os.getenv("ASR_PROJECT_ID", ""))
-    easyllm_id: str = field(default_factory=lambda: os.getenv("ASR_EASYLLM_ID", ""))
+    project_id: str = field(default_factory=lambda: os.getenv("ASR_PROJECT_ID", "4EygjiMQCjGljeZ8tFJlZD"))
+    easyllm_id: str = field(default_factory=lambda: os.getenv("ASR_EASYLLM_ID", "7asJ6QtG2wmknC3iBH7l4B"))
     api_key: str = field(default_factory=lambda: os.getenv(
         "ASR_API_KEY",
         "CL9TPTG2Qro1oto8pSyBq6bQpXFCRs8g-Yl2d7nuElQBr2HtqkA19yu7wC1Zy6DGWOe4BELfLoZXUfuhD3yIoQ"

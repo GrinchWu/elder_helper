@@ -84,17 +84,19 @@ class ASRService:
             return True
         
         url = self._build_ws_url()
-        logger.info(f"正在连接ASR服务...")
+        logger.info(f"正在连接ASR服务: {url}")
         
         try:
             self._ws = await websockets.connect(
                 url,
-                ping_interval=30,
-                ping_timeout=10,
+                ping_interval=None,  # 禁用ping，使用heartbeat
+                ping_timeout=None,
+                close_timeout=10,
             )
             
             # 等待连接确认
             response = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
+            logger.info(f"ASR连接响应: {response}")
             data = json.loads(response)
             
             if data.get("status") == "ok":

@@ -23,6 +23,8 @@ from .services.planner_service import PlannerService
 from .services.safety_service import SafetyService
 from .services.executor_service import ExecutorService
 from .services.embedding_service import EmbeddingService
+from .services.tts_service import TTSService
+from .services.asr_service import ASRService, ASRConfig, AudioCapture
 from .knowledge.rag_service import RAGService
 
 
@@ -40,11 +42,14 @@ class AgentGUI:
         self._output_text: Optional[scrolledtext.ScrolledText] = None
         self._status_label: Optional[tk.Label] = None
         self._send_btn: Optional[tk.Button] = None
+        self._voice_btn: Optional[tk.Button] = None
         self._feedback_entry: Optional[tk.Entry] = None
         self._feedback_btn: Optional[tk.Button] = None
+        self._feedback_voice_btn: Optional[tk.Button] = None
         
         # 状态
         self._is_processing = False
+        self._is_recording = False
         self._current_task: Optional[Task] = None
     
     def run(self):
@@ -120,6 +125,9 @@ class AgentGUI:
         self._input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self._input_entry.bind('<Return>', lambda e: self._on_send())
         
+        self._voice_btn = ttk.Button(input_inner, text="🎤 语音", command=self._on_voice_input)
+        self._voice_btn.pack(side=tk.RIGHT, padx=(0, 5))
+        
         self._send_btn = ttk.Button(input_inner, text="发送", command=self._on_send)
         self._send_btn.pack(side=tk.RIGHT)
         
@@ -133,6 +141,9 @@ class AgentGUI:
         self._feedback_entry = ttk.Entry(feedback_inner, font=('Microsoft YaHei', 11))
         self._feedback_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self._feedback_entry.bind('<Return>', lambda e: self._on_feedback())
+        
+        self._feedback_voice_btn = ttk.Button(feedback_inner, text="🎤", command=self._on_feedback_voice)
+        self._feedback_voice_btn.pack(side=tk.RIGHT, padx=(0, 5))
         
         self._feedback_btn = ttk.Button(feedback_inner, text="反馈", command=self._on_feedback)
         self._feedback_btn.pack(side=tk.RIGHT)
@@ -215,6 +226,66 @@ class AgentGUI:
                 self._agent.process_feedback(feedback),
                 self._loop
             )
+    
+    def _on_voice_input(self):
+        """语音输入按钮点击"""
+        if self._is_processing or self._is_recording:
+            return
+        
+        self._is_recording = True
+        self._voice_btn.config(text="🔴 录音中...")
+        self._update_status("🎤 正在录音，请说话...")
+        
+        if self._agent and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._agent.voice_input(callback=self._on_voice_result),
+                self._loop
+            )
+    
+    def _on_voice_result(self, text: str):
+        """语音识别结果回调"""
+        def update():
+            self._is_recording = False
+            self._voice_btn.config(text="🎤 语音")
+            if text:
+                self._input_entry.delete(0, tk.END)
+                self._input_entry.insert(0, text)
+                self._on_send()
+            else:
+                self._update_status("❌ 未识别到语音")
+        
+        if self._root:
+            self._root.after(0, update)
+    
+    def _on_feedback_voice(self):
+        """反馈语音输入"""
+        if self._is_recording:
+            return
+        
+        self._is_recording = True
+        self._feedback_voice_btn.config(text="🔴")
+        self._update_status("🎤 正在录音，请说话...")
+        
+        if self._agent and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._agent.voice_input(callback=self._on_feedback_voice_result),
+                self._loop
+            )
+    
+    def _on_feedback_voice_result(self, text: str):
+        """反馈语音识别结果回调"""
+        def update():
+            self._is_recording = False
+            self._feedback_voice_btn.config(text="🎤")
+            if text:
+                self._feedback_entry.delete(0, tk.END)
+                self._feedback_entry.insert(0, text)
+                self._on_feedback()
+            else:
+                self._update_status("❌ 未识别到语音")
+        
+        if self._root:
+            self._root.after(0, update)
     
     def _quick_command(self, command: str):
         """快捷命令"""
@@ -320,6 +391,9 @@ class GUIElderlyAgent:
         self._embedding: Optional[EmbeddingService] = None
         self._rag: Optional[RAGService] = None
         self._knowledge_graph: Optional[KnowledgeGraph] = None
+        self._tts: Optional[TTSService] = None
+        self._asr: Optional[ASRService] = None
+        self._audio_capture: Optional[AudioCapture] = None
         
         self._user_profile: Optional[UserProfile] = None
         self._current_plan: Optional[TaskPlan] = None
@@ -327,6 +401,21 @@ class GUIElderlyAgent:
 
     async def initialize(self):
         """初始化所有服务"""
+        self._gui._update_status("⏳ 初始化语音服务...")
+        self._tts = TTSService()
+        await self._tts.initialize()
+        
+        self._gui._update_status("⏳ 初始化语音识别服务...")
+        asr_config = ASRConfig(
+            project_id=config.asr.project_id,
+            easyllm_id=config.asr.easyllm_id,
+            api_key=config.asr.api_key,
+            format=config.asr.format,
+            sample_rate=config.asr.sample_rate,
+        )
+        self._asr = ASRService(asr_config)
+        await self._asr.initialize()
+        
         self._gui._update_status("⏳ 初始化意图理解服务...")
         self._llm = LLMService()
         await self._llm.initialize()
@@ -381,9 +470,16 @@ class GUIElderlyAgent:
         )
         
         logger.info("GUI Agent 初始化完成")
+        
+        # 播放欢迎语音
+        await self._tts.speak_welcome()
     
     async def close(self):
         """关闭所有服务"""
+        if self._asr:
+            await self._asr.close()
+        if self._tts:
+            await self._tts.close()
         if self._llm:
             await self._llm.close()
         if self._vision:
@@ -400,17 +496,23 @@ class GUIElderlyAgent:
         try:
             # 1. 安全检查
             self._gui._update_status("🛡️ 安全检查中...")
+            await self._tts.speak("正在进行安全检查")
             safety_result = self._safety.check_text_safety(user_input)
             if not safety_result.is_safe:
                 if safety_result.blocked_reason:
-                    self._gui.show_message(f"⚠️ 安全警告：{safety_result.blocked_reason}", 'warning')
+                    msg = f"⚠️ 安全警告：{safety_result.blocked_reason}"
+                    self._gui.show_message(msg, 'warning')
+                    await self._tts.speak(f"安全警告：{safety_result.blocked_reason}")
                     self._gui.done_processing()
                     return
                 else:
-                    self._gui.show_message(f"⚠️ 提醒：{', '.join(safety_result.warnings)}", 'warning')
+                    msg = f"⚠️ 提醒：{', '.join(safety_result.warnings)}"
+                    self._gui.show_message(msg, 'warning')
+                    await self._tts.speak(f"提醒：{', '.join(safety_result.warnings)}")
             
             # 2. 意图理解
             self._gui._update_status("🧠 理解您的意图...")
+            await self._tts.speak("正在理解您的意图")
             intent = await self._llm.understand_intent(
                 user_input=user_input,
                 user_profile=self._user_profile,
@@ -421,16 +523,21 @@ class GUIElderlyAgent:
             self._gui.show_system(f"🎯 目标应用：{intent.target_app or '未指定'}")
             
             if intent.confidence.is_low:
-                self._gui.show_message("🤔 我不太确定您想做什么，能再说详细一点吗？", 'warning')
+                msg = "我不太确定您想做什么，能再说详细一点吗？"
+                self._gui.show_message(f"🤔 {msg}", 'warning')
+                await self._tts.speak(msg)
                 self._gui.done_processing()
                 return
             
             # 3. 截屏分析
             self._gui._update_status("👁️ 分析当前屏幕...")
+            await self._tts.speak("正在分析当前屏幕")
             screenshot, original_size = await self._vision.capture_screen()
             
             if not screenshot:
-                self._gui.show_message("❌ 截屏失败，请重试", 'error')
+                msg = "截屏失败，请重试"
+                self._gui.show_message(f"❌ {msg}", 'error')
+                await self._tts.speak_error(msg)
                 self._gui.done_processing()
                 return
             
@@ -442,16 +549,26 @@ class GUIElderlyAgent:
             self._gui.show_system(f"📱 当前应用：{screen_state.app_name}")
             self._gui.show_system(f"📄 页面状态：{screen_state.screen_state}")
             
+            # 构建更详细的屏幕描述，包含桌面状态信息
+            detailed_description = screen_state.description
+            if screen_state.is_desktop:
+                detailed_description = f"【当前是Windows桌面】{detailed_description}"
+                if not screen_state.has_open_window:
+                    detailed_description += "（没有打开的应用窗口）"
+            elif screen_state.foreground_app:
+                detailed_description = f"【当前应用：{screen_state.foreground_app}】{detailed_description}"
+            
             screen_analysis = ScreenAnalysis(
                 app_name=screen_state.app_name,
                 screen_type=screen_state.screen_state,
-                description=screen_state.description,
+                description=detailed_description,
                 suggested_actions=[screen_state.suggested_action] if screen_state.suggested_action else [],
                 warnings=screen_state.warnings,
             )
             
             # 4. 任务规划
             self._gui._update_status("📋 生成任务计划...")
+            await self._tts.speak("正在生成任务计划")
             plan = await self._planner.create_plan(
                 intent=intent,
                 screen_analysis=screen_analysis,
@@ -459,16 +576,36 @@ class GUIElderlyAgent:
             self._current_plan = plan
             
             if not plan.steps:
-                self._gui.show_message("🤔 抱歉，我不太确定该怎么帮您完成这个操作。您能再说详细一点吗？", 'warning')
+                msg = "抱歉，我不太确定该怎么帮您完成这个操作。您能再说详细一点吗？"
+                self._gui.show_message(f"🤔 {msg}", 'warning')
+                await self._tts.speak(msg)
                 self._gui.done_processing()
                 return
             
-            # 显示计划
+            # 检查是否是 "完成" 动作 - 任务已经完成，无需执行
+            from .models.action import ActionType
+            if len(plan.steps) == 1 and plan.steps[0].action and plan.steps[0].action.action_type == ActionType.DONE:
+                done_step = plan.steps[0]
+                msg = done_step.friendly_instruction or '任务已经完成了，不需要其他操作。'
+                self._gui.show_message(f"✅ {msg}", 'success')
+                await self._tts.speak_success(msg)
+                self._gui._update_status("✅ 任务已完成")
+                self._gui.done_processing()
+                return
+            
+            # 显示计划并语音播报
             steps_text = "\n".join([f"  {i+1}. {s.friendly_instruction or s.description}" for i, s in enumerate(plan.steps)])
             self._gui.show_message(f"📋 我准备这样帮您操作：\n{steps_text}\n\n请按照提示操作，我会在旁边指导您。", 'agent')
             
+            # 语音播报计划
+            plan_voice = "我准备这样帮您操作："
+            for i, s in enumerate(plan.steps):
+                plan_voice += f"第{i+1}步，{s.friendly_instruction or s.description}。"
+            await self._tts.speak(plan_voice)
+            
             # 5. 询问确认后执行
             self._gui._update_status("⏳ 等待确认...")
+            await self._tts.speak("是否开始执行？")
             self._gui.ask_confirmation(
                 "是否开始执行？",
                 self._on_confirm_execute
@@ -479,18 +616,27 @@ class GUIElderlyAgent:
             import traceback
             traceback.print_exc()
             self._gui.show_message(f"❌ 抱歉，出了点问题：{e}", 'error')
+            await self._tts.speak_error(str(e))
             self._gui.done_processing()
     
     async def _on_confirm_execute(self, confirmed: bool):
         """确认执行回调"""
         if not confirmed:
             self._gui.show_message("⏹️ 已取消执行", 'system')
+            await self._tts.speak("已取消执行")
             self._gui.done_processing()
             return
         
         try:
             self._gui._update_status("⚡ 执行任务中...")
             self._gui.show_message("▶️ 开始执行，请按照提示操作...", 'agent')
+            await self._tts.speak("开始执行，请按照提示操作")
+            
+            # 逐步执行并语音播报
+            total_steps = len(self._current_plan.steps) if self._current_plan else 0
+            for i, step in enumerate(self._current_plan.steps if self._current_plan else []):
+                step_msg = step.friendly_instruction or step.description
+                await self._tts.speak_step(i + 1, total_steps, step_msg)
             
             task = await self._executor.execute_task(
                 self._current_intent, 
@@ -499,14 +645,18 @@ class GUIElderlyAgent:
             
             if task.status == TaskStatus.COMPLETED:
                 self._gui.show_message("🎉 太棒了！任务完成！", 'success')
+                await self._tts.speak_success("太棒了！任务完成！")
                 self._gui._update_status("✅ 任务完成")
             else:
-                self._gui.show_message(f"⚠️ 任务未完成，状态：{task.status.value}\n如果遇到问题，请在下方反馈框告诉我。", 'warning')
+                msg = f"任务未完成，状态：{task.status.value}。如果遇到问题，请在下方反馈框告诉我。"
+                self._gui.show_message(f"⚠️ {msg}", 'warning')
+                await self._tts.speak(msg)
                 self._gui._update_status("⚠️ 任务未完成")
             
         except Exception as e:
             logger.error(f"执行任务时出错: {e}")
             self._gui.show_message(f"❌ 执行出错：{e}", 'error')
+            await self._tts.speak_error(str(e))
             self._gui._update_status("❌ 执行出错")
         
         finally:
@@ -515,6 +665,7 @@ class GUIElderlyAgent:
     async def process_feedback(self, feedback: str):
         """处理用户反馈"""
         self._gui._update_status("🔄 处理反馈中...")
+        await self._tts.speak("正在处理您的反馈")
         
         try:
             # 使用LLM理解反馈内容
@@ -524,6 +675,7 @@ class GUIElderlyAgent:
             )
             
             self._gui.show_message(f"💡 {response.content}", 'agent')
+            await self._tts.speak(response.content)
             
             # 如果执行器正在运行，提交反馈
             if self._executor:
@@ -533,7 +685,58 @@ class GUIElderlyAgent:
             
         except Exception as e:
             logger.error(f"处理反馈时出错: {e}")
-            self._gui.show_message("收到您的反馈，我会尝试调整。", 'agent')
+            msg = "收到您的反馈，我会尝试调整。"
+            self._gui.show_message(msg, 'agent')
+            await self._tts.speak(msg)
+    
+    async def voice_input(self, callback, duration: float = 5.0):
+        """语音输入"""
+        try:
+            await self._tts.speak("请说话")
+            
+            # 初始化音频采集
+            self._audio_capture = AudioCapture(
+                sample_rate=config.asr.sample_rate,
+                channels=1,
+                chunk_size=3200,
+            )
+            
+            # 开始录音
+            self._audio_capture.start()
+            
+            # 收集音频数据
+            audio_data = b""
+            start_time = asyncio.get_event_loop().time()
+            
+            async for chunk in self._audio_capture.get_audio_stream():
+                audio_data += chunk
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= duration:
+                    break
+            
+            # 停止录音
+            self._audio_capture.stop()
+            
+            if not audio_data:
+                callback("")
+                return
+            
+            # 发送到ASR识别
+            self._gui._update_status("🔄 正在识别语音...")
+            result = await self._asr.recognize_audio(audio_data)
+            
+            recognized_text = result.text.strip() if result.text else ""
+            logger.info(f"语音识别结果: {recognized_text}")
+            
+            if recognized_text:
+                await self._tts.speak(f"您说的是：{recognized_text}")
+            
+            callback(recognized_text)
+            
+        except Exception as e:
+            logger.error(f"语音输入失败: {e}")
+            await self._tts.speak_error("语音识别失败，请重试")
+            callback("")
 
 
 def main():
@@ -542,7 +745,7 @@ def main():
     logger.remove()
     logger.add(
         sys.stderr,
-        level="WARNING",
+        level="INFO",
         format="<dim>{time:HH:mm:ss}</dim> | <level>{message}</level>",
     )
     

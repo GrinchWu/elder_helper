@@ -29,12 +29,13 @@ class TaskStep:
     """任务步骤"""
     id: UUID = field(default_factory=uuid4)
     step_number: int = 0
-    description: str = ""                    # 步骤描述
+    description: str = ""                    # 步骤描述（标准化格式：动作{目标}）
     friendly_instruction: str = ""           # 老年人友好的指令
     action: Optional[Action] = None
     status: ActionStatus = ActionStatus.PENDING
     
-    # 视觉提示
+    # 视觉提示（新增：帮助用户找到目标）
+    visual_hint: str = ""                    # 如："屏幕左下角的Windows图标"
     highlight_area: Optional[tuple[int, int, int, int]] = None  # x, y, width, height
     
     # 预期结果描述
@@ -46,6 +47,12 @@ class TaskStep:
     def to_voice_instruction(self) -> str:
         """生成语音指令"""
         return self.friendly_instruction or self.description
+    
+    def to_skill_format(self) -> str:
+        """转换为标准化技能格式"""
+        if self.action:
+            return self.action.to_skill_instruction()
+        return self.description
 
 
 @dataclass

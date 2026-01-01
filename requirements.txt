@@ -13,7 +13,6 @@ pydantic>=2.5.0
 
 # HTTP/WebSocket客户端
 httpx>=0.25.0
-pynput>=1.7.6
 websockets>=12.0
 
 # 数据处理
@@ -38,6 +37,10 @@ redis>=5.0.0
 # 配置和日志
 python-dotenv>=1.0.0
 loguru>=0.7.0
+
+# 视频/搜索
+yt-dlp>=2024.1.0
+duckduckgo-search>=4.0.0
 
 # ============================================
 # 开发依赖 (可选)
