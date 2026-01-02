@@ -18,6 +18,7 @@ from ..models.intent import Intent
 from ..models.action import Action, ActionType, ActionStatus
 from ..models.task import Task, TaskStep, TaskPlan, TaskStatus
 from .vision_service import VisionService, ScreenAnalysis, ScreenStateAnalysis, VLConfig, PageStatus
+from ..agent.executor import ActionExecutor
 from .planner_service import PlannerService
 
 
@@ -204,6 +205,7 @@ class ExecutorService:
         self._planner: Optional[PlannerService] = None
         self._input_listener: Optional[InputListener] = None
         self._context: Optional[ExecutionContext] = None
+        self._action_executor: Optional[ActionExecutor] = None
         
         # 标记是否使用外部服务
         self._external_vision = False
@@ -248,6 +250,10 @@ class ExecutorService:
         # 初始化输入监听器
         self._input_listener = InputListener()
         
+        # 初始化动作执行器
+        self._action_executor = ActionExecutor()
+        await self._action_executor.initialize()
+        
         logger.info("ExecutorService初始化完成")
     
     async def close(self):
@@ -289,6 +295,44 @@ class ExecutorService:
         if self._on_ask_user:
             self._on_ask_user(question)
     
+    async def execute_step(self, step: TaskStep) -> bool:
+        """
+        执行单个步骤
+        
+        Args:
+            step: 要执行的任务步骤
+            
+        Returns:
+            bool: 执行是否成功
+        """
+        if not step or not step.action:
+            logger.warning("步骤或动作为空")
+            return False
+        
+        if not self._action_executor:
+            logger.error("ActionExecutor 未初始化")
+            return False
+        
+        try:
+            logger.info(f"执行步骤: {step.friendly_instruction or step.description}")
+            
+            # 执行动作
+            result = await self._action_executor.execute(step.action)
+            
+            if result.success:
+                logger.info(f"步骤执行成功: {result.message}")
+                step.status = ActionStatus.SUCCESS
+                return True
+            else:
+                logger.warning(f"步骤执行失败: {result.message}")
+                step.status = ActionStatus.FAILED
+                return False
+                
+        except Exception as e:
+            logger.error(f"执行步骤时出错: {e}")
+            step.status = ActionStatus.FAILED
+            return False
+    
     async def execute_task(self, intent: Intent, plan: Optional[TaskPlan] = None) -> Task:
         """
         执行任务的主入口
@@ -297,6 +341,14 @@ class ExecutorService:
             intent: 用户意图
             plan: 可选的任务计划，如果不传则内部生成
         """
+        # 验证 intent 参数类型
+        if not isinstance(intent, Intent):
+            logger.error(f"execute_task 接收到非法的 intent 类型: {type(intent).__name__}")
+            # 返回失败的任务
+            task = Task(intent=None)
+            task.status = TaskStatus.FAILED
+            return task
+            
         task = Task(intent=intent)
         
         try:
@@ -305,9 +357,10 @@ class ExecutorService:
             screenshot, original_size = await self._vision.capture_screen()
             
             # 使用第一层分析：页面状态分析（轻量级）
+            user_intent_text = intent.normalized_text or intent.raw_text if intent else ""
             screen_state = await self._vision.analyze_screen_state(
                 screenshot, 
-                user_intent=intent.raw_text,
+                user_intent=user_intent_text,
             )
             
             self._notify_status(f"当前应用: {screen_state.app_name}")

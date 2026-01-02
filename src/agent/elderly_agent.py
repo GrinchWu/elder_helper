@@ -413,7 +413,7 @@ class ElderlyAssistantAgent:
     async def _ask_for_clarification(self, original_text: str) -> None:
         """请求澄清"""
         await self._speak(
-            f"您说的是"{original_text}"对吗？"
+            f'您说的是"{original_text}"对吗？'
             "我不太确定您想做什么，能再说详细一点吗？"
         )
         self._set_state(AgentState.LISTENING)
