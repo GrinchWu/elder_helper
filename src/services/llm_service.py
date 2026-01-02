@@ -416,6 +416,8 @@ class LLMService:
     "target_app": "目标应用名称",
     "target_contact": "目标联系人（如有）",
     "specific_action": "具体要执行的操作",
+    "target_state": "任务完成时屏幕应该显示的状态（如：浏览器显示人民网首页）",
+    "success_criteria": ["判断任务完成的具体条件1", "判断任务完成的具体条件2"],
     "confidence": 0.0-1.0,
     "parameters": {{}},
     "clarification_needed": false,
@@ -618,6 +620,10 @@ class LLMService:
                 intent.target_app = data.get("target_app")
                 intent.confidence = Confidence(data.get("confidence", 0.5))
                 intent.parameters = data.get("parameters", {})
+                
+                # 解析目标状态和成功条件
+                intent.target_state = data.get("target_state", "")
+                intent.success_criteria = data.get("success_criteria", [])
                 
                 # 添加具体操作到参数
                 if data.get("specific_action"):

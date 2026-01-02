@@ -26,7 +26,7 @@ from src.services.tts_service import TTSService
 from src.services.asr_service import ASRService, ASRConfig, AudioCapture
 from src.knowledge.rag_service import RAGService
 from src.knowledge.video_extractor import VideoKnowledgeExtractor
-from src.models.action import ActionType
+from src.models.action import Action, ActionType
 from loguru import logger
 
 
@@ -298,12 +298,12 @@ class ElderlyAgent:
                 warnings=screen_state.warnings,
             )
             
-            # ========== 混合模式：ReAct循环执行 ==========
-            self._signals.status_changed.emit("执行中...")
+            # ========== 完整规划模式：一次性生成计划 + 执行时验证 ==========
+            self._signals.status_changed.emit("规划中...")
             await self._tts.speak("好的，我来帮您操作")
             
-            # 使用ReAct循环模式
-            await self._react_execution_loop(intent, screen_analysis, screenshot)
+            # 一次性生成完整计划
+            await self._plan_and_execute(intent, screen_analysis, screenshot)
             
         except Exception as e:
             logger.error(f"处理出错: {e}")
@@ -315,6 +315,181 @@ class ElderlyAgent:
             self._reset_idle_timer()
             self._signals.processing_done.emit()
     
+    async def _plan_and_execute(self, intent: Intent, screen_analysis: ScreenAnalysis, screenshot: bytes):
+        """完整规划 + 逐步执行验证模式
+        
+        流程：
+        1. 一次性生成完整计划（使用大模型）
+        2. 逐步执行，每步执行后观察屏幕
+        3. 验证执行结果是否符合预期
+        4. 如果偏离预期，触发重规划
+        """
+        import time
+        max_replan_attempts = 3  # 最大重规划次数
+        replan_count = 0
+        current_screen = screen_analysis
+        current_screenshot = screenshot
+        
+        while replan_count <= max_replan_attempts:
+            # ========== 1. 生成完整计划 ==========
+            logger.info(f"[规划] 生成完整计划 (第{replan_count + 1}次)...")
+            self._signals.status_changed.emit("规划中...")
+            
+            plan_start = time.time()
+            plan = await self._planner.create_plan(
+                intent=intent,
+                screen_analysis=current_screen,
+            )
+            plan_time = time.time() - plan_start
+            logger.info(f"[规划] 计划生成完成，耗时: {plan_time:.2f}s，共 {len(plan.steps)} 步")
+            
+            # 打印计划步骤
+            for i, step in enumerate(plan.steps):
+                logger.info(f"  步骤 {i+1}: {step.description}")
+            
+            if not plan.steps:
+                await self._tts.speak("抱歉，我不知道该怎么帮您完成这个操作")
+                self._signals.status_changed.emit("规划失败")
+                return
+            
+            # 检查第一步是否就是完成
+            if plan.steps[0].action and plan.steps[0].action.action_type == ActionType.DONE:
+                await self._tts.speak_success("任务已经完成了！")
+                self._signals.status_changed.emit("完成")
+                return
+            
+            # 播报计划概要
+            total_steps = len([s for s in plan.steps if s.action and s.action.action_type != ActionType.DONE])
+            if total_steps > 1:
+                await self._tts.speak(f"需要{total_steps}个步骤")
+            
+            # ========== 2. 逐步执行计划 ==========
+            self._signals.status_changed.emit("执行中...")
+            execution_success = True
+            
+            for step_idx, step in enumerate(plan.steps):
+                self._reset_idle_timer()
+                
+                # 检查是否是完成步骤
+                if step.action and step.action.action_type == ActionType.DONE:
+                    await self._tts.speak_success("任务完成！")
+                    self._signals.status_changed.emit("完成")
+                    return
+                
+                # 播报当前步骤
+                step_msg = step.friendly_instruction
+                if not step_msg or len(step_msg) > 40:
+                    step_msg = self._format_action_message(step.action)
+                
+                logger.info(f"[执行] 步骤 {step_idx + 1}/{len(plan.steps)}: {step_msg}")
+                self._signals.status_changed.emit(f"步骤 {step_idx + 1}: {step_msg[:20]}...")
+                await self._tts.speak(step_msg)
+                
+                # 等待用户操作
+                await asyncio.sleep(2.5)
+                
+                # ========== 3. 观察执行结果 ==========
+                new_screenshot, _ = await self._vision.capture_screen()
+                if new_screenshot:
+                    new_state = await self._vision.analyze_screen_state(
+                        new_screenshot,
+                        user_intent=intent.normalized_text
+                    )
+                    new_screen = ScreenAnalysis(
+                        app_name=new_state.app_name,
+                        screen_type=new_state.screen_state,
+                        description=new_state.description,
+                    )
+                    logger.info(f"[观察] 当前屏幕: {new_state.app_name} - {new_state.screen_state}")
+                    
+                    # ========== 4. 验证执行结果 ==========
+                    # 检查是否已经达到目标状态
+                    if self._check_goal_reached(intent, new_screen):
+                        await self._tts.speak_success("任务完成！")
+                        self._signals.status_changed.emit("完成")
+                        return
+                    
+                    # 检查是否需要重规划（屏幕状态与预期不符）
+                    expected_result = step.expected_result or ""
+                    if expected_result and not self._verify_step_result(expected_result, new_screen):
+                        logger.warning(f"[验证] 步骤结果与预期不符，预期: {expected_result}")
+                        logger.warning(f"[验证] 实际屏幕: {new_state.description[:100]}")
+                        
+                        # 如果还有重规划机会，触发重规划
+                        if replan_count < max_replan_attempts:
+                            await self._tts.speak("操作结果和预期不太一样，让我重新规划")
+                            current_screen = new_screen
+                            current_screenshot = new_screenshot
+                            execution_success = False
+                            break
+                    
+                    # 更新当前屏幕状态
+                    current_screen = new_screen
+                    current_screenshot = new_screenshot
+            
+            # 如果执行成功完成所有步骤
+            if execution_success:
+                # 最终检查是否达到目标
+                if self._check_goal_reached(intent, current_screen):
+                    await self._tts.speak_success("任务完成！")
+                    self._signals.status_changed.emit("完成")
+                else:
+                    await self._tts.speak("操作步骤已完成，请检查是否达到您的目标")
+                    self._signals.status_changed.emit("已完成步骤")
+                return
+            
+            # 重规划
+            replan_count += 1
+            logger.info(f"[重规划] 触发重规划，第 {replan_count} 次")
+        
+        # 达到最大重规划次数
+        await self._tts.speak("多次尝试后仍无法完成，请告诉我具体遇到了什么问题")
+        self._signals.status_changed.emit("需要帮助")
+    
+    def _check_goal_reached(self, intent: Intent, screen: ScreenAnalysis) -> bool:
+        """检查是否已达到目标状态"""
+        # 如果有目标应用，检查是否已打开
+        if intent.target_app:
+            target_app = intent.target_app.lower()
+            current_app = screen.app_name.lower()
+            
+            # 浏览器类应用特殊处理
+            browser_keywords = ["浏览器", "edge", "chrome", "firefox", "360", "browser"]
+            if any(kw in target_app for kw in browser_keywords):
+                if any(kw in current_app for kw in browser_keywords):
+                    return True
+            elif target_app in current_app or current_app in target_app:
+                return True
+        
+        # 如果有目标状态描述，检查关键词匹配
+        if intent.target_state:
+            target_keywords = [kw for kw in intent.target_state.lower().split() if len(kw) > 1]
+            current_state = f"{screen.app_name} {screen.screen_type} {screen.description}".lower()
+            
+            if target_keywords:
+                match_count = sum(1 for kw in target_keywords if kw in current_state)
+                if match_count >= len(target_keywords) * 0.5:
+                    return True
+        
+        return False
+    
+    def _verify_step_result(self, expected: str, screen: ScreenAnalysis) -> bool:
+        """验证步骤执行结果是否符合预期"""
+        if not expected:
+            return True
+        
+        expected_lower = expected.lower()
+        current_state = f"{screen.app_name} {screen.screen_type} {screen.description}".lower()
+        
+        # 提取预期结果的关键词
+        keywords = [kw for kw in expected_lower.split() if len(kw) > 1]
+        if not keywords:
+            return True
+        
+        # 检查关键词匹配率
+        match_count = sum(1 for kw in keywords if kw in current_state)
+        return match_count >= len(keywords) * 0.3  # 30%匹配即认为符合预期
+
     async def _react_execution_loop(self, intent: Intent, screen_analysis: ScreenAnalysis, screenshot: bytes):
         """ReAct循环执行模式 - 观察->规划->执行->观察..."""
         max_steps = 10
@@ -345,19 +520,22 @@ class ElderlyAgent:
                 self._signals.status_changed.emit("完成")
                 return
             
-            # 2. 播报当前步骤
-            step_msg = next_step.friendly_instruction or next_step.description
-            await self._tts.speak(f"第{step_num + 1}步，{step_msg}")
+            # 2. 播报当前步骤 - 只输出动作，不输出思考过程
+            # 优先使用 friendly_instruction（已经是简洁的动作描述）
+            step_msg = next_step.friendly_instruction
+            
+            # 如果 friendly_instruction 为空或太长，直接从 action 生成
+            if not step_msg or len(step_msg) > 30:
+                step_msg = self._format_action_message(next_step.action)
+            
+            await self._tts.speak(step_msg)
             self._signals.status_changed.emit(f"步骤 {step_num + 1}: {step_msg[:20]}...")
+            logger.info(f"[ReAct] 执行: {step_msg}")
             
-            # 3. 执行动作（这里等待用户操作或自动执行）
-            # TODO: 实现自动执行，目前等待用户手动操作
-            logger.info(f"[ReAct] 等待用户执行: {step_msg}")
-            
-            # 4. 动作后延迟0.5s再分析
+            # 3. 动作后延迟0.5s再分析
             await asyncio.sleep(0.5)
             
-            # 5. 观察新屏幕状态
+            # 4. 观察新屏幕状态
             new_screenshot, _ = await self._vision.capture_screen()
             if new_screenshot:
                 new_state = await self._vision.analyze_screen_state(
@@ -372,7 +550,7 @@ class ElderlyAgent:
                 current_screenshot = new_screenshot
                 logger.info(f"[ReAct] 新屏幕状态: {new_state.app_name} - {new_state.screen_state}")
             
-            # 记录历史
+            # 记录历史（简短描述）
             history.append(f"{step_num + 1}. {step_msg}")
             
             # 简单等待让用户有时间操作
@@ -381,6 +559,47 @@ class ElderlyAgent:
         # 达到最大步骤
         await self._tts.speak("操作步骤较多，请告诉我是否需要继续")
         self._signals.status_changed.emit("等待确认")
+
+    def _format_action_message(self, action: Action) -> str:
+        """格式化动作为简洁的语音输出（只描述动作本身）"""
+        if not action:
+            return "请稍等"
+        
+        action_type = action.action_type
+        target = action.element_description or ""
+        text = action.text or ""
+        key = action.key or ""
+        hotkey = action.hotkey or ""
+        
+        # 限制目标描述长度
+        if len(target) > 15:
+            target = target[:15]
+        
+        if action_type == ActionType.CLICK:
+            return f"请点击{target}" if target else "请点击"
+        elif action_type == ActionType.DOUBLE_CLICK:
+            return f"请双击{target}" if target else "请双击"
+        elif action_type == ActionType.RIGHT_CLICK:
+            return f"请右键点击{target}" if target else "请右键点击"
+        elif action_type == ActionType.TYPE:
+            return f"请输入{text}" if text else "请输入"
+        elif action_type == ActionType.KEY_PRESS:
+            return f"请按{key}键" if key else "请按键"
+        elif action_type == ActionType.HOTKEY:
+            return f"请按{hotkey}" if hotkey else "请按组合键"
+        elif action_type == ActionType.SCROLL:
+            direction = action.scroll_direction or "down"
+            return "请向上滚动" if direction == "up" else "请向下滚动"
+        elif action_type == ActionType.DRAG:
+            return f"请拖动{target}" if target else "请拖动"
+        elif action_type == ActionType.WAIT:
+            return "请稍等"
+        elif action_type == ActionType.WAIT_ELEMENT:
+            return f"请等待{target}出现" if target else "请等待"
+        elif action_type == ActionType.DONE:
+            return "完成"
+        else:
+            return "请操作"
 
     async def process_question(self, question: str):
         """处理用户提问（简单问答，不执行任务）"""

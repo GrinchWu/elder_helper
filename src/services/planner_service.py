@@ -764,8 +764,16 @@ class PlannerService:
         """
         history = history or []
         
+        # 构建目标状态信息
+        target_state_info = ""
+        if intent.target_state:
+            target_state_info = f"\n目标完成状态：{intent.target_state}"
+        if intent.success_criteria:
+            target_state_info += f"\n成功判断条件：{', '.join(intent.success_criteria)}"
+        
         # 使用ReAct风格的提示
         prompt = f"""目标：{intent.normalized_text or intent.raw_text}
+{target_state_info}
 
 当前屏幕：
 - 应用：{screen_analysis.app_name}
@@ -773,6 +781,12 @@ class PlannerService:
 - 描述：{screen_analysis.description}
 
 {"已完成步骤：" + chr(10).join(history) if history else "这是第一步"}
+
+【重要】判断任务是否完成的规则：
+1. 只有当前屏幕状态完全符合"目标完成状态"时，才能输出"完成"
+2. 如果当前在桌面，而目标是打开某个应用或网站，任务显然未完成
+3. 如果目标应用还没打开，必须先打开应用
+4. 不要因为"可以完成"就输出完成，要等到"已经完成"
 
 请给出下一步的Thought和Action。"""
 
@@ -788,6 +802,22 @@ class PlannerService:
             
             # 使用ReAct解析方式
             react_step = self._parse_react_step(content)
+            
+            logger.info(f"[规划] 解析结果: action_type={react_step.action.action_type.value if react_step.action else 'None'}, "
+                       f"target={react_step.action.element_description if react_step.action else 'None'}")
+            
+            # 额外检查：如果解析出"完成"，验证是否真的完成
+            if react_step.action and react_step.action.action_type == ActionType.DONE:
+                logger.info(f"[规划] 检测到完成动作，验证任务状态...")
+                logger.info(f"[规划] 当前屏幕: {screen_analysis.app_name} / {screen_analysis.screen_type}")
+                logger.info(f"[规划] 目标应用: {intent.target_app}, 目标状态: {intent.target_state}")
+                
+                if not self._verify_task_completion(intent, screen_analysis):
+                    logger.warning("[规划] 验证失败：目标状态未达到，生成后备步骤")
+                    # 强制返回一个实际操作而不是完成
+                    return self._generate_fallback_step(intent, screen_analysis, history)
+                else:
+                    logger.info("[规划] 验证通过：任务确实完成")
             
             if react_step.action:
                 # 生成友好的操作描述（只描述动作，不包含推理过程）
@@ -815,12 +845,107 @@ class PlannerService:
         except Exception as e:
             logger.error(f"快速规划失败: {type(e).__name__}: {e}")
         
-        # 返回默认完成步骤
+        # 返回默认等待步骤（而不是完成）
         return TaskStep(
             step_number=1,
-            description="完成",
-            friendly_instruction="无法确定下一步操作",
-            action=Action(action_type=ActionType.DONE),
+            description="等待",
+            friendly_instruction="请稍等，正在分析",
+            action=Action(action_type=ActionType.WAIT, wait_ms=2000),
+        )
+    
+    def _verify_task_completion(self, intent: Intent, screen_analysis: ScreenAnalysis) -> bool:
+        """验证任务是否真的完成
+        
+        返回 True 表示任务确实完成，可以输出"完成"
+        返回 False 表示任务未完成，需要继续执行
+        """
+        current_app = screen_analysis.app_name.lower()
+        current_type = screen_analysis.screen_type.lower()
+        current_desc = screen_analysis.description.lower()
+        
+        # 规则1：如果当前在桌面，且目标不是"回到桌面"，则未完成
+        is_on_desktop = "桌面" in current_app or "桌面" in current_type or "desktop" in current_app
+        
+        if is_on_desktop:
+            # 检查目标是否就是回到桌面
+            target_text = (intent.normalized_text or intent.raw_text).lower()
+            if "桌面" not in target_text and "desktop" not in target_text:
+                logger.debug(f"验证失败：当前在桌面，但目标不是桌面 (目标: {target_text})")
+                return False
+        
+        # 规则2：如果有目标应用，检查当前应用是否匹配
+        if intent.target_app:
+            target_app_lower = intent.target_app.lower()
+            
+            # 特殊处理：浏览器类应用
+            browser_keywords = ["浏览器", "edge", "chrome", "firefox", "360", "browser"]
+            target_is_browser = any(kw in target_app_lower for kw in browser_keywords)
+            current_is_browser = any(kw in current_app for kw in browser_keywords)
+            
+            if target_is_browser:
+                if not current_is_browser:
+                    logger.debug(f"验证失败：目标是浏览器，但当前不是浏览器 (当前: {current_app})")
+                    return False
+            else:
+                # 非浏览器应用，检查名称匹配
+                if target_app_lower not in current_app and current_app not in target_app_lower:
+                    logger.debug(f"验证失败：目标应用 {target_app_lower} 与当前应用 {current_app} 不匹配")
+                    return False
+        
+        # 规则3：如果有明确的目标状态，检查当前屏幕是否匹配
+        if intent.target_state:
+            target_state_lower = intent.target_state.lower()
+            current_state = f"{current_app} {current_type} {current_desc}"
+            
+            # 提取目标状态的关键词
+            target_keywords = [kw for kw in target_state_lower.split() if len(kw) > 1]
+            
+            if target_keywords:
+                # 检查目标关键词是否出现在当前状态中
+                match_count = sum(1 for kw in target_keywords if kw in current_state)
+                match_ratio = match_count / len(target_keywords)
+                
+                if match_ratio < 0.3:  # 至少匹配30%的关键词
+                    logger.debug(f"验证失败：目标状态关键词匹配率 {match_ratio:.1%} < 30%")
+                    return False
+        
+        # 规则4：如果有成功条件，检查是否满足
+        if intent.success_criteria:
+            for criterion in intent.success_criteria:
+                criterion_lower = criterion.lower()
+                if criterion_lower not in current_desc and criterion_lower not in current_type:
+                    logger.debug(f"验证失败：成功条件 '{criterion}' 未满足")
+                    return False
+        
+        logger.debug("验证通过：任务可以标记为完成")
+        return True
+    
+    def _generate_fallback_step(self, intent: Intent, screen_analysis: ScreenAnalysis, history: list[str]) -> TaskStep:
+        """生成后备步骤（当错误判断为完成时）"""
+        # 如果在桌面，需要打开应用
+        if "桌面" in screen_analysis.app_name or "桌面" in screen_analysis.screen_type:
+            return TaskStep(
+                step_number=len(history) + 1,
+                description="单击: 开始按钮",
+                friendly_instruction="请点击开始按钮",
+                action=Action(action_type=ActionType.CLICK, element_description="开始按钮"),
+            )
+        
+        # 如果有目标应用但还没打开
+        if intent.target_app:
+            return TaskStep(
+                step_number=len(history) + 1,
+                description=f"输入: {intent.target_app}",
+                friendly_instruction=f"请输入{intent.target_app}",
+                action=Action(action_type=ActionType.TYPE, text=intent.target_app),
+            )
+        
+        # 默认等待
+        return TaskStep(
+            step_number=len(history) + 1,
+            description="等待",
+            friendly_instruction="请稍等",
+            action=Action(action_type=ActionType.WAIT, wait_ms=2000),
         )
     
     def _generate_friendly_instruction(self, action: Action) -> str:
@@ -928,7 +1053,10 @@ Action: 完成"""
         return "\n".join(parts)
     
     def _parse_react_step(self, content: str) -> ReActStep:
-        """解析ReAct步骤 - 支持从reasoning_content中提取"""
+        """解析ReAct步骤 - 支持从reasoning_content中提取
+        
+        重要：对"完成"的判断必须非常严格，避免误判
+        """
         step = ReActStep()
         
         if not content:
@@ -936,7 +1064,8 @@ Action: 完成"""
         
         lines = content.strip().split("\n")
         
-        # 先尝试标准格式解析
+        # 先尝试标准格式解析（Action: xxx）
+        action_line_found = False
         for line in lines:
             line = line.strip()
             if line.lower().startswith("thought:"):
@@ -945,23 +1074,31 @@ Action: 完成"""
                 action_str = line[7:].strip()
                 step.action = self._parse_react_action_string(action_str)
                 step.state = PlannerState.ACTING
+                action_line_found = True
+        
+        # 如果找到了标准格式的Action行，直接返回（不再做后续模糊匹配）
+        if action_line_found and step.action:
+            # 设置简短的thought
+            if not step.thought or len(step.thought) > 50:
+                step.thought = f"{step.action.action_type.value}"
+            return step
         
         # 如果没有解析出action，尝试从内容中提取关键操作
         if not step.action:
             import re
             
             # 优先查找标准格式的动作（技能集中的12种操作）
+            # 注意：不包含"完成"，完成需要单独严格判断
             skill_patterns = [
-                (r'单击[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.CLICK),
-                (r'双击[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.DOUBLE_CLICK),
-                (r'右键单击[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.RIGHT_CLICK),
-                (r'输入[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.TYPE),
-                (r'按下[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.KEY_PRESS),
-                (r'组合键[：:\s]*[「"\'【]?([^」"\'】\n，。]+)[」"\'】]?', ActionType.HOTKEY),
-                (r'向上滚动[：:\s]*[「"\'【]?([^」"\'】\n，。]*)[」"\'】]?', ActionType.SCROLL),
-                (r'向下滚动[：:\s]*[「"\'【]?([^」"\'】\n，。]*)[」"\'】]?', ActionType.SCROLL),
-                (r'等待[：:\s]*(\d+)', ActionType.WAIT),
-                (r'完成', ActionType.DONE),
+                (r'单击[：:\s]*[「"\'【]?([^」"\'】\n，。]{2,20})[」"\'】]?', ActionType.CLICK),
+                (r'双击[：:\s]*[「"\'【]?([^」"\'】\n，。]{2,20})[」"\'】]?', ActionType.DOUBLE_CLICK),
+                (r'右键单击[：:\s]*[「"\'【]?([^」"\'】\n，。]{2,20})[」"\'】]?', ActionType.RIGHT_CLICK),
+                (r'输入[：:\s]*[「"\'【]?([^」"\'】\n，。]{1,50})[」"\'】]?', ActionType.TYPE),
+                (r'按下[：:\s]*[「"\'【]?([^」"\'】\n，。]{1,20})[」"\'】]?', ActionType.KEY_PRESS),
+                (r'组合键[：:\s]*[「"\'【]?([^」"\'】\n，。]{2,20})[」"\'】]?', ActionType.HOTKEY),
+                (r'向上滚动[：:\s]*[「"\'【]?([^」"\'】\n，。]{0,20})[」"\'】]?', ActionType.SCROLL),
+                (r'向下滚动[：:\s]*[「"\'【]?([^」"\'】\n，。]{0,20})[」"\'】]?', ActionType.SCROLL),
+                (r'等待[：:\s]*(\d+)[秒s]?', ActionType.WAIT),
             ]
             
             for pattern, action_type in skill_patterns:
@@ -992,9 +1129,24 @@ Action: 完成"""
                     step.state = PlannerState.ACTING
                     break
             
-            # 如果还是没有，检查是否提到任务完成
+            # 严格判断"完成"：只有在非常明确的情况下才返回完成
+            # 必须是独立的"完成"指令，而不是出现在推理过程中
             if not step.action:
-                if any(kw in content for kw in ["已完成", "完成了", "任务完成", "不需要", "无需"]):
+                # 严格的完成模式：必须是明确的完成指令格式
+                strict_done_patterns = [
+                    r'^完成$',                          # 单独一行只有"完成"
+                    r'^Action[：:\s]*完成',              # Action: 完成
+                    r'^动作[：:\s]*完成',                # 动作: 完成
+                    r'skill_type["\']?\s*[：:]\s*["\']?完成',  # JSON格式
+                ]
+                
+                is_done = False
+                for pattern in strict_done_patterns:
+                    if re.search(pattern, content, re.MULTILINE | re.IGNORECASE):
+                        is_done = True
+                        break
+                
+                if is_done:
                     step.action = Action(action_type=ActionType.DONE)
                     step.thought = "任务已完成"
                     step.state = PlannerState.COMPLETED

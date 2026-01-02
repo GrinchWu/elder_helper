@@ -54,6 +54,8 @@ class Intent:
     confidence: Confidence = field(default_factory=lambda: Confidence(0.0))
     target_app: Optional[str] = None                # 目标应用
     target_contact: Optional[str] = None            # 目标联系人
+    target_state: str = ""                          # 目标完成状态描述（如"浏览器显示新闻网站首页"）
+    success_criteria: list[str] = field(default_factory=list)  # 成功判断条件列表
     parameters: dict[str, str] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     
