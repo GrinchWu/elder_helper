@@ -127,114 +127,6 @@ async def test_planner_with_vision():
         await planner.close()
 
 
-async def test_react_mode():
-    """测试ReAct模式的任务规划"""
-    from src.services.vision_service import VisionService, VLConfig
-    from src.services.planner_service import PlannerService, PlannerContext
-    from src.models.intent import Intent, IntentType
-    
-    print("=" * 70)
-    print("ReAct模式任务规划测试")
-    print("=" * 70)
-    print("ReAct模式会逐步思考和执行，每一步都会观察结果")
-    print("输入 'quit' 退出")
-    print("=" * 70)
-    
-    # 初始化服务
-    vl_config = VLConfig(
-        api_key="CL9TPTG2Qro1oto8pSyBq6bQpXFCRs8g-Yl2d7nuElQBr2HtqkA19yu7wC1Zy6DGWOe4BELfLoZXUfuhD3yIoQ",
-        model="Qwen3-VL-235B-A22B-Instruct",
-    )
-    
-    vision = VisionService(vl_config)
-    await vision.initialize()
-    
-    planner = PlannerService()
-    await planner.initialize()
-    
-    try:
-        while True:
-            print("\n" + "-" * 70)
-            user_input = input("请输入您的需求: ").strip()
-            
-            if user_input.lower() == 'quit':
-                print("再见！")
-                break
-            
-            if not user_input:
-                continue
-            
-            # 截取屏幕
-            print("\n📸 正在截取屏幕...")
-            screenshot, original_size = await vision.capture_screen()
-            
-            if not screenshot:
-                print("❌ 截图失败")
-                continue
-            
-            print("🔍 正在分析屏幕...")
-            screen_analysis = await vision.analyze_screen(
-                screenshot,
-                user_intent=user_input,
-                original_size=original_size
-            )
-            
-            # 创建意图和上下文
-            intent = Intent(
-                raw_text=user_input,
-                normalized_text=user_input,
-                intent_type=IntentType.NAVIGATION,
-            )
-            
-            context = PlannerContext(
-                intent=intent,
-                current_screen=screen_analysis,
-                max_steps=10,
-            )
-            
-            # ReAct循环
-            print("\n" + "=" * 70)
-            print("🤖 ReAct推理过程")
-            print("=" * 70)
-            
-            for step_num in range(context.max_steps):
-                print(f"\n--- 第 {step_num + 1} 步 ---")
-                
-                # 获取下一步建议
-                react_step = await planner.suggest_next_action(context)
-                
-                print(f"💭 思考: {react_step.thought}")
-                
-                if react_step.action:
-                    print(f"🎯 动作: {react_step.action.action_type.value}")
-                    if react_step.action.element_description:
-                        print(f"   目标: {react_step.action.element_description}")
-                    if react_step.action.text:
-                        print(f"   输入: {react_step.action.text}")
-                    
-                    # 检查是否完成
-                    if react_step.action.action_type.value == "confirm":
-                        print("\n✅ 任务规划完成！")
-                        break
-                
-                # 模拟观察（实际应该执行动作后观察）
-                react_step.observation = "等待执行..."
-                context.history.append(react_step)
-                
-                # 询问是否继续
-                cont = input("\n按Enter继续下一步，输入'stop'停止: ").strip()
-                if cont.lower() == 'stop':
-                    break
-            
-            print("\n" + "=" * 70)
-            
-    except KeyboardInterrupt:
-        print("\n\n已中断")
-    finally:
-        await vision.close()
-        await planner.close()
-
-
 async def test_quick_plan():
     """快速测试：只生成计划，不进入交互模式"""
     from src.services.vision_service import VisionService, VLConfig
@@ -336,17 +228,14 @@ def main():
     print("任务规划测试")
     print("=" * 70)
     print("1. 交互式任务规划（推荐）")
-    print("2. ReAct模式测试")
-    print("3. 快速测试")
+    print("2. 快速测试")
     print("=" * 70)
     
-    choice = input("请选择 (1/2/3): ").strip()
+    choice = input("请选择 (1/2): ").strip()
     
     if choice == "1":
         asyncio.run(test_planner_with_vision())
     elif choice == "2":
-        asyncio.run(test_react_mode())
-    elif choice == "3":
         asyncio.run(test_quick_plan())
     else:
         print("默认运行交互式任务规划...")

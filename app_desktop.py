@@ -3,32 +3,38 @@
 集成语音输入/输出、任务执行功能
 支持：需求录音、提问录音、重新开始流程
 """
+import asyncio
 import os
 import sys
-import asyncio
 import threading
-from PyQt5.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout,
-                             QLabel, QPushButton, QLineEdit, QGraphicsDropShadowEffect)
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QColor, QPainter, QPainterPath, QBrush, QLinearGradient
+
+from loguru import logger
+from PyQt5.QtCore import QObject, QPoint, Qt, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPainterPath
+from PyQt5.QtWidgets import (
+    
+    QApplication,
+    QHBoxLayout,
+    QLineEdit,
+    QPushButton,
+    QWidget,
+)
 
 from src.config import config
-from src.models.intent import Intent
-from src.models.task import Task, TaskStatus, TaskPlan
-from src.models.session import UserProfile
-from src.models.knowledge import KnowledgeGraph
-from src.services.llm_service import LLMService
-from src.services.vision_service import VisionService, VLConfig, ScreenAnalysis
-from src.services.planner_service import PlannerService
-from src.services.safety_service import SafetyService
-from src.services.executor_service import ExecutorService
-from src.services.embedding_service import EmbeddingService
-from src.services.tts_service import TTSService
-from src.services.asr_service import ASRService, ASRConfig, AudioCapture
 from src.knowledge.rag_service import RAGService
 from src.knowledge.video_extractor import VideoKnowledgeExtractor
 from src.models.action import Action, ActionType
-from loguru import logger
+from src.models.intent import Intent
+from src.models.knowledge import KnowledgeGraph
+from src.models.session import UserProfile
+from src.services.asr_service import ASRConfig, ASRService, AudioCapture
+from src.services.embedding_service import EmbeddingService
+from src.services.executor_service import ExecutorService
+from src.services.llm_service import LLMService
+from src.services.planner_service import PlannerService
+from src.services.safety_service import SafetyService
+from src.services.tts_service import TTSService
+from src.services.vision_service import ScreenAnalysis, VisionService, VLConfig
 
 
 class SignalBridge(QObject):
@@ -42,7 +48,7 @@ class SignalBridge(QObject):
 
 class ElderlyAgent:
     """老年人助手Agent"""
-    
+
     def __init__(self, signals: SignalBridge):
         self._signals = signals
         self._llm = None
@@ -70,7 +76,7 @@ class ElderlyAgent:
         self._signals.status_changed.emit("初始化语音服务...")
         self._tts = TTSService()
         await self._tts.initialize()
-        
+
         self._signals.status_changed.emit("初始化语音识别...")
         asr_config = ASRConfig(
             project_id=config.asr.project_id,
@@ -79,30 +85,29 @@ class ElderlyAgent:
         )
         self._asr = ASRService(asr_config)
         await self._asr.initialize()
-        
+
         self._signals.status_changed.emit("初始化意图理解...")
         self._llm = LLMService()
         await self._llm.initialize()
-        
+
         self._signals.status_changed.emit("初始化视觉服务...")
         vl_config = VLConfig(
             api_key=config.api.api_key,
             model_light=config.api.vl_model_light,
-            model_heavy=config.api.vl_model_heavy,
         )
         self._vision = VisionService(vl_config)
         await self._vision.initialize()
-        
+
         self._signals.status_changed.emit("初始化规划服务...")
         self._planner = PlannerService()
         await self._planner.initialize()
-        
+
         self._safety = SafetyService()
-        
+
         self._signals.status_changed.emit("初始化知识服务...")
         self._embedding = EmbeddingService()
         await self._embedding.initialize()
-        
+
         self._knowledge_graph = KnowledgeGraph()
         self._rag = RAGService()
         await self._rag.initialize(
@@ -110,12 +115,12 @@ class ElderlyAgent:
             knowledge_graph=self._knowledge_graph,
         )
         self._planner.set_rag_service(self._rag)
-        
+
         # 构建知识库（从B站搜索或使用预置数据）
         self._signals.status_changed.emit("构建知识库...")
         self._video_extractor = VideoKnowledgeExtractor()
         await self._video_extractor.initialize()
-        
+
         try:
             # 使用带回退的构建方法（如果B站搜索失败则使用预置数据）
             kb_stats = await self._video_extractor.build_knowledge_base_with_fallback(self._rag)
@@ -123,22 +128,22 @@ class ElderlyAgent:
         except Exception as e:
             logger.warning(f"知识库构建失败，使用预置数据: {e}")
             await self._video_extractor._load_preset_knowledge(self._rag)
-        
+
         self._signals.status_changed.emit("初始化执行服务...")
         self._executor = ExecutorService()
         self._executor.set_vision_service(self._vision)
         self._executor.set_planner_service(self._planner)
         await self._executor.initialize()
-        
+
         self._user_profile = UserProfile(
             name="用户",
             family_mapping={"老二": "张小明", "闺女": "张小红"},
             frequent_contacts=["张小明", "张小红"],
         )
-        
+
         self._signals.status_changed.emit("准备就绪")
         await self._tts.speak_welcome()
-        
+
         self._last_action_time = asyncio.get_event_loop().time()
         self._idle_check_task = asyncio.create_task(self._check_idle())
 
@@ -151,7 +156,7 @@ class ElderlyAgent:
                 if elapsed >= self._idle_timeout:
                     await self._tts.speak("您好，需要我帮您做什么吗？")
                     self._last_action_time = asyncio.get_event_loop().time()
-    
+
     def _reset_idle_timer(self):
         """重置空闲计时器"""
         self._last_action_time = asyncio.get_event_loop().time()
@@ -159,13 +164,13 @@ class ElderlyAgent:
     async def close(self):
         """关闭服务并清理所有异步任务"""
         logger.info("正在停止 Agent 服务...")
-        
+
         # 1. 取消特定的监控任务
         if self._idle_check_task:
             self._idle_check_task.cancel()
-            
+
         # 2. 关闭所有子服务
-        for svc in [self._asr, self._tts, self._llm, self._vision, 
+        for svc in [self._asr, self._tts, self._llm, self._vision,
                     self._planner, self._executor, self._embedding, self._video_extractor]:
             if svc:
                 try:
@@ -179,13 +184,13 @@ class ElderlyAgent:
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             for task in tasks:
                 task.cancel()
-            
+
             # 等待任务取消完成
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
             logger.warning(f"清理剩余任务时出错: {e}")
-            
+
         logger.info("Agent 服务已停止")
 
     async def start_recording(self):
@@ -204,14 +209,14 @@ class ElderlyAgent:
         if not self._is_recording:
             self._signals.recording_done.emit("", input_type)
             return
-        
+
         self._is_recording = False
         try:
             if self._audio_capture:
                 audio_data = self._audio_capture.get_all_audio()
                 self._audio_capture.stop()
                 self._audio_capture = None
-                
+
                 if audio_data:
                     self._signals.status_changed.emit("识别中...")
                     logger.info(f"音频数据大小: {len(audio_data)} bytes")
@@ -241,21 +246,21 @@ class ElderlyAgent:
         self._reset_idle_timer()
         try:
             self._signals.status_changed.emit("安全检查...")
-            
+
             safety_result = self._safety.check_text_safety(user_input)
             if not safety_result.is_safe and safety_result.blocked_reason:
                 await self._tts.speak(f"安全警告：{safety_result.blocked_reason}")
                 self._signals.processing_done.emit()
                 return
-            
+
             # ========== 并行执行：意图理解 + 屏幕截图 + RAG搜索 ==========
             self._signals.status_changed.emit("分析中...")
             logger.info("=" * 50)
             logger.info("[并行处理] 开始并行执行：意图理解 + 屏幕截图 + RAG搜索")
-            
+
             import time
             start_time = time.time()
-            
+
             # 创建并行任务
             intent_task = asyncio.create_task(
                 self._llm.understand_intent(user_input, self._user_profile)
@@ -266,45 +271,45 @@ class ElderlyAgent:
             rag_task = asyncio.create_task(
                 self._rag.retrieve(user_input, top_k=3)
             )
-            
+
             # 等待所有任务完成
             intent, (screenshot, original_size), rag_result = await asyncio.gather(
                 intent_task, screenshot_task, rag_task,
                 return_exceptions=True
             )
-            
+
             parallel_time = time.time() - start_time
             logger.info(f"[并行处理] 完成，耗时: {parallel_time:.2f}s")
-            
+
             # 处理可能的异常
             if isinstance(intent, Exception):
                 logger.error(f"意图理解失败: {intent}")
                 await self._tts.speak("抱歉，我没有理解您的意思")
                 self._signals.processing_done.emit()
                 return
-            
+
             if isinstance(screenshot, Exception) or not screenshot:
                 logger.error(f"截屏失败: {screenshot}")
                 await self._tts.speak("截屏失败")
                 self._signals.processing_done.emit()
                 return
-            
+
             self._current_intent = intent
             logger.info(f"[意图理解] 原始输入: {user_input}")
             logger.info(f"[意图理解] 规范化文本: {intent.normalized_text}")
             logger.info(f"[意图理解] 置信度: {intent.confidence}")
-            
+
             if intent.confidence.is_low:
                 await self._tts.speak("我不太确定您想做什么，能再说详细一点吗？")
                 self._signals.processing_done.emit()
                 return
-            
+
             # RAG结果日志
             if not isinstance(rag_result, Exception) and (rag_result.guides or rag_result.nodes):
                 logger.info(f"[RAG搜索] 找到 {len(rag_result.guides)} 条指南, {len(rag_result.nodes)} 个知识节点")
             else:
                 logger.info("[RAG搜索] 未找到相关结果")
-            
+
             # ========== 屏幕分析（需要intent结果）==========
             self._signals.status_changed.emit("分析屏幕...")
             screen_state = await self._vision.analyze_screen_state(
@@ -313,7 +318,7 @@ class ElderlyAgent:
             logger.info(f"[屏幕分析] 应用: {screen_state.app_name}")
             logger.info(f"[屏幕分析] 状态: {screen_state.screen_state}")
             logger.info("=" * 50)
-            
+
             screen_analysis = ScreenAnalysis(
                 app_name=screen_state.app_name,
                 screen_type=screen_state.screen_state,
@@ -321,14 +326,14 @@ class ElderlyAgent:
                 suggested_actions=[screen_state.suggested_action] if screen_state.suggested_action else [],
                 warnings=screen_state.warnings,
             )
-            
+
             # ========== 完整规划模式：一次性生成计划 + 执行时验证 ==========
             self._signals.status_changed.emit("规划中...")
             await self._tts.speak("好的，我来帮您操作")
-            
+
             # 一次性生成完整计划
             await self._plan_and_execute(intent, screen_analysis, screenshot)
-            
+
         except Exception as e:
             logger.error(f"处理出错: {e}")
             import traceback
@@ -338,7 +343,7 @@ class ElderlyAgent:
         finally:
             self._reset_idle_timer()
             self._signals.processing_done.emit()
-    
+
     async def _plan_and_execute(self, intent: Intent, screen_analysis: ScreenAnalysis, screenshot: bytes):
         """完整规划 + 逐步执行验证模式
         
@@ -353,12 +358,12 @@ class ElderlyAgent:
         replan_count = 0
         current_screen = screen_analysis
         current_screenshot = screenshot
-        
+
         while replan_count <= max_replan_attempts:
             # ========== 1. 生成完整计划 ==========
             logger.info(f"[规划] 生成完整计划 (第{replan_count + 1}次)...")
             self._signals.status_changed.emit("规划中...")
-            
+
             plan_start = time.time()
             plan = await self._planner.create_plan(
                 intent=intent,
@@ -366,52 +371,52 @@ class ElderlyAgent:
             )
             plan_time = time.time() - plan_start
             logger.info(f"[规划] 计划生成完成，耗时: {plan_time:.2f}s，共 {len(plan.steps)} 步")
-            
+
             # 打印计划步骤
             for i, step in enumerate(plan.steps):
                 logger.info(f"  步骤 {i+1}: {step.description}")
-            
+
             if not plan.steps:
                 await self._tts.speak("抱歉，我不知道该怎么帮您完成这个操作")
                 self._signals.status_changed.emit("规划失败")
                 return
-            
+
             # 检查第一步是否就是完成
             if plan.steps[0].action and plan.steps[0].action.action_type == ActionType.DONE:
                 await self._tts.speak_success("任务已经完成了！")
                 self._signals.status_changed.emit("完成")
                 return
-            
+
             # 播报计划概要
             total_steps = len([s for s in plan.steps if s.action and s.action.action_type != ActionType.DONE])
             if total_steps > 1:
                 await self._tts.speak(f"需要{total_steps}个步骤")
-            
+
             # ========== 2. 逐步执行计划 ==========
             self._signals.status_changed.emit("执行中...")
             execution_success = True
-            
+
             for step_idx, step in enumerate(plan.steps):
                 self._reset_idle_timer()
-                
+
                 # 检查是否是完成步骤
                 if step.action and step.action.action_type == ActionType.DONE:
                     await self._tts.speak_success("任务完成！")
                     self._signals.status_changed.emit("完成")
                     return
-                
+
                 # 播报当前步骤
                 step_msg = step.friendly_instruction
                 if not step_msg or len(step_msg) > 40:
                     step_msg = self._format_action_message(step.action)
-                
+
                 logger.info(f"[执行] 步骤 {step_idx + 1}/{len(plan.steps)}: {step_msg}")
                 self._signals.status_changed.emit(f"步骤 {step_idx + 1}: {step_msg[:20]}...")
                 await self._tts.speak(step_msg)
-                
+
                 # 等待用户操作
                 await asyncio.sleep(2.5)
-                
+
                 # ========== 3. 观察执行结果 ==========
                 new_screenshot, _ = await self._vision.capture_screen()
                 if new_screenshot:
@@ -425,58 +430,90 @@ class ElderlyAgent:
                         description=new_state.description,
                     )
                     logger.info(f"[观察] 当前屏幕: {new_state.app_name} - {new_state.screen_state}")
-                    
+
                     # ========== 4. 验证执行结果 ==========
                     # 检查是否已经达到目标状态
-                    if self._check_goal_reached(intent, new_screen):
+                    task_goal = (intent.target_state or "").strip() or intent.normalized_text or intent.raw_text
+                    goal_achieved, goal_reason = await self._vision.check_goal_achieved(
+                        task_goal=task_goal,
+                        screenshot=new_screenshot,
+                        screen_state=new_state,
+                    )
+                    if goal_achieved:
+                        if goal_reason:
+                            logger.info(f"[完成判定] {goal_reason}")
                         await self._tts.speak_success("任务完成！")
                         self._signals.status_changed.emit("完成")
                         return
-                    
+
                     # 检查是否需要重规划（屏幕状态与预期不符）
                     expected_result = step.expected_result or ""
-                    if expected_result and not self._verify_step_result(expected_result, new_screen):
-                        logger.warning(f"[验证] 步骤结果与预期不符，预期: {expected_result}")
-                        logger.warning(f"[验证] 实际屏幕: {new_state.description[:100]}")
-                        
-                        # 如果还有重规划机会，触发重规划
-                        if replan_count < max_replan_attempts:
-                            await self._tts.speak("操作结果和预期不太一样，让我重新规划")
-                            current_screen = new_screen
-                            current_screenshot = new_screenshot
-                            execution_success = False
-                            break
-                    
+                    if expected_result:
+                        step_desc = step.friendly_instruction or step.description or step_msg
+                        step_ok, step_changes, step_reason = await self._vision.verify_step_completion(
+                            before_screenshot=current_screenshot,
+                            after_screenshot=new_screenshot,
+                            step_description=step_desc,
+                            expected_result=expected_result,
+                        )
+                        if step_changes:
+                            logger.info(f"[步骤变化] {step_changes}")
+                        if not step_ok:
+                            logger.warning(f"[验证] 步骤结果与预期不符，预期: {expected_result}")
+                            if step_reason:
+                                logger.warning(f"[验证] 原因: {step_reason}")
+                            logger.warning(f"[验证] 实际屏幕: {new_state.description[:100]}")
+
+                            # 如果还有重规划机会，触发重规划
+                            if replan_count < max_replan_attempts:
+                                await self._tts.speak("操作结果和预期不太一样，让我重新规划")
+                                current_screen = new_screen
+                                current_screenshot = new_screenshot
+                                execution_success = False
+                                break
+
                     # 更新当前屏幕状态
                     current_screen = new_screen
                     current_screenshot = new_screenshot
-            
+
             # 如果执行成功完成所有步骤
             if execution_success:
                 # 最终检查是否达到目标
-                if self._check_goal_reached(intent, current_screen):
+                final_state = await self._vision.analyze_screen_state(
+                    current_screenshot,
+                    user_intent=intent.normalized_text,
+                )
+                final_goal = (intent.target_state or "").strip() or intent.normalized_text or intent.raw_text
+                final_achieved, final_reason = await self._vision.check_goal_achieved(
+                    task_goal=final_goal,
+                    screenshot=current_screenshot,
+                    screen_state=final_state,
+                )
+                if final_achieved:
+                    if final_reason:
+                        logger.info(f"[完成判定] {final_reason}")
                     await self._tts.speak_success("任务完成！")
                     self._signals.status_changed.emit("完成")
                 else:
                     await self._tts.speak("操作步骤已完成，请检查是否达到您的目标")
                     self._signals.status_changed.emit("已完成步骤")
                 return
-            
+
             # 重规划
             replan_count += 1
             logger.info(f"[重规划] 触发重规划，第 {replan_count} 次")
-        
+
         # 达到最大重规划次数
         await self._tts.speak("多次尝试后仍无法完成，请告诉我具体遇到了什么问题")
         self._signals.status_changed.emit("需要帮助")
-    
+
     def _check_goal_reached(self, intent: Intent, screen: ScreenAnalysis) -> bool:
         """检查是否已达到目标状态"""
         # 如果有目标应用，检查是否已打开
         if intent.target_app:
             target_app = intent.target_app.lower()
             current_app = screen.app_name.lower()
-            
+
             # 浏览器类应用特殊处理
             browser_keywords = ["浏览器", "edge", "chrome", "firefox", "360", "browser"]
             if any(kw in target_app for kw in browser_keywords):
@@ -484,121 +521,51 @@ class ElderlyAgent:
                     return True
             elif target_app in current_app or current_app in target_app:
                 return True
-        
+
         # 如果有目标状态描述，检查关键词匹配
         if intent.target_state:
             target_keywords = [kw for kw in intent.target_state.lower().split() if len(kw) > 1]
             current_state = f"{screen.app_name} {screen.screen_type} {screen.description}".lower()
-            
+
             if target_keywords:
                 match_count = sum(1 for kw in target_keywords if kw in current_state)
                 if match_count >= len(target_keywords) * 0.5:
                     return True
-        
+
         return False
-    
+
     def _verify_step_result(self, expected: str, screen: ScreenAnalysis) -> bool:
         """验证步骤执行结果是否符合预期"""
         if not expected:
             return True
-        
+
         expected_lower = expected.lower()
         current_state = f"{screen.app_name} {screen.screen_type} {screen.description}".lower()
-        
+
         # 提取预期结果的关键词
         keywords = [kw for kw in expected_lower.split() if len(kw) > 1]
         if not keywords:
             return True
-        
+
         # 检查关键词匹配率
         match_count = sum(1 for kw in keywords if kw in current_state)
         return match_count >= len(keywords) * 0.3  # 30%匹配即认为符合预期
-
-    async def _react_execution_loop(self, intent: Intent, screen_analysis: ScreenAnalysis, screenshot: bytes):
-        """ReAct循环执行模式 - 观察->规划->执行->观察..."""
-        max_steps = 10
-        history = []
-        current_screen = screen_analysis
-        current_screenshot = screenshot
-        
-        for step_num in range(max_steps):
-            self._reset_idle_timer()
-            
-            # 1. 快速规划下一步（使用Qwen3-14B，目标<3s）
-            logger.info(f"[ReAct] 步骤 {step_num + 1}: 规划中...")
-            import time
-            plan_start = time.time()
-            
-            next_step = await self._planner.plan_next_step(
-                intent=intent,
-                screen_analysis=current_screen,
-                history=history,
-            )
-            
-            plan_time = time.time() - plan_start
-            logger.info(f"[ReAct] 规划耗时: {plan_time:.2f}s")
-            
-            # 检查是否完成
-            if next_step.action and next_step.action.action_type == ActionType.DONE:
-                await self._tts.speak_success("任务完成！")
-                self._signals.status_changed.emit("完成")
-                return
-            
-            # 2. 播报当前步骤 - 只输出动作，不输出思考过程
-            # 优先使用 friendly_instruction（已经是简洁的动作描述）
-            step_msg = next_step.friendly_instruction
-            
-            # 如果 friendly_instruction 为空或太长，直接从 action 生成
-            if not step_msg or len(step_msg) > 30:
-                step_msg = self._format_action_message(next_step.action)
-            
-            await self._tts.speak(step_msg)
-            self._signals.status_changed.emit(f"步骤 {step_num + 1}: {step_msg[:20]}...")
-            logger.info(f"[ReAct] 执行: {step_msg}")
-            
-            # 3. 动作后延迟0.5s再分析
-            await asyncio.sleep(0.5)
-            
-            # 4. 观察新屏幕状态
-            new_screenshot, _ = await self._vision.capture_screen()
-            if new_screenshot:
-                new_state = await self._vision.analyze_screen_state(
-                    new_screenshot, 
-                    user_intent=intent.normalized_text
-                )
-                current_screen = ScreenAnalysis(
-                    app_name=new_state.app_name,
-                    screen_type=new_state.screen_state,
-                    description=new_state.description,
-                )
-                current_screenshot = new_screenshot
-                logger.info(f"[ReAct] 新屏幕状态: {new_state.app_name} - {new_state.screen_state}")
-            
-            # 记录历史（简短描述）
-            history.append(f"{step_num + 1}. {step_msg}")
-            
-            # 简单等待让用户有时间操作
-            await asyncio.sleep(2)
-        
-        # 达到最大步骤
-        await self._tts.speak("操作步骤较多，请告诉我是否需要继续")
-        self._signals.status_changed.emit("等待确认")
 
     def _format_action_message(self, action: Action) -> str:
         """格式化动作为简洁的语音输出（只描述动作本身）"""
         if not action:
             return "请稍等"
-        
+
         action_type = action.action_type
         target = action.element_description or ""
         text = action.text or ""
         key = action.key or ""
         hotkey = action.hotkey or ""
-        
+
         # 限制目标描述长度
         if len(target) > 15:
             target = target[:15]
-        
+
         if action_type == ActionType.CLICK:
             return f"请点击{target}" if target else "请点击"
         elif action_type == ActionType.DOUBLE_CLICK:
@@ -631,7 +598,7 @@ class ElderlyAgent:
         try:
             self._signals.status_changed.emit("思考中...")
             logger.info(f"[提问] 用户问题: {question}")
-            
+
             # RAG搜索相关知识
             logger.info("=" * 50)
             logger.info("[RAG搜索] 搜索问题相关知识...")
@@ -657,19 +624,19 @@ class ElderlyAgent:
                 logger.warning(f"[RAG搜索] 搜索失败: {e}")
                 context = ""
             logger.info("=" * 50)
-            
+
             # 使用LLM回答问题
             if context:
                 prompt = f"根据以下知识回答用户问题：\n\n知识：{context}\n\n问题：{question}\n\n请用简洁易懂的语言回答："
             else:
                 prompt = f"请用简洁易懂的语言回答以下问题：{question}"
-            
+
             response = await self._llm.chat(prompt)
             logger.info(f"[回答] {response}")
-            
+
             await self._tts.speak(response)
             self._signals.status_changed.emit("回答完成")
-            
+
         except Exception as e:
             logger.error(f"回答问题出错: {e}")
             await self._tts.speak("抱歉，我无法回答这个问题")
@@ -680,7 +647,7 @@ class ElderlyAgent:
 
 class SimpleAssistantUI(QWidget):
     """简洁助手界面"""
-    
+
     def __init__(self):
         super().__init__()
         self._drag_pos = QPoint()
@@ -691,28 +658,28 @@ class SimpleAssistantUI(QWidget):
         self._agent = None
         self._loop = None
         self._agent_thread = None
-        
+
         self._signals.status_changed.connect(self._on_status_changed)
         self._signals.recording_done.connect(self._on_recording_done)
         self._signals.processing_done.connect(self._on_processing_done)
         self._signals.reset_done.connect(self._on_reset_done)
-        
+
         self.initUI()
         self._start_agent()
-    
+
     def initUI(self):
         """初始化界面"""
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(550, 70)
-        
+
         screen = QApplication.primaryScreen().geometry()
         self.move((screen.width() - 550) // 2, 20)
-        
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(15, 10, 15, 10)
         layout.setSpacing(8)
-        
+
         # 需求录音按钮（开始/停止）
         self._req_btn = QPushButton("🎤需求")
         self._req_btn.setFixedSize(70, 50)
@@ -726,7 +693,7 @@ class SimpleAssistantUI(QWidget):
         """)
         self._req_btn.clicked.connect(self._on_req_click)
         layout.addWidget(self._req_btn)
-        
+
         # 提问录音按钮
         self._ask_btn = QPushButton("❓提问")
         self._ask_btn.setFixedSize(70, 50)
@@ -740,7 +707,7 @@ class SimpleAssistantUI(QWidget):
         """)
         self._ask_btn.clicked.connect(self._on_ask_click)
         layout.addWidget(self._ask_btn)
-        
+
         # 输入框
         self._input = QLineEdit()
         self._input.setPlaceholderText("输入需求或问题...")
@@ -752,7 +719,7 @@ class SimpleAssistantUI(QWidget):
         """)
         self._input.returnPressed.connect(self._on_send)
         layout.addWidget(self._input)
-        
+
         # 发送按钮
         self._send_btn = QPushButton("➤")
         self._send_btn.setFixedSize(45, 45)
@@ -766,7 +733,7 @@ class SimpleAssistantUI(QWidget):
         """)
         self._send_btn.clicked.connect(self._on_send)
         layout.addWidget(self._send_btn)
-        
+
         # 重新开始按钮
         self._reset_btn = QPushButton("🔄")
         self._reset_btn.setFixedSize(45, 45)
@@ -781,7 +748,7 @@ class SimpleAssistantUI(QWidget):
         """)
         self._reset_btn.clicked.connect(self._on_reset_click)
         layout.addWidget(self._reset_btn)
-        
+
         # 关闭按钮
         close_btn = QPushButton("×")
         close_btn.setFixedSize(30, 30)
@@ -795,7 +762,7 @@ class SimpleAssistantUI(QWidget):
         """)
         close_btn.clicked.connect(self.close)
         layout.addWidget(close_btn)
-        
+
         # 注意：在Windows上透明窗口使用阴影效果可能导致UpdateLayeredWindowIndirect错误
         # 如需阴影效果，可取消下面注释
         # shadow = QGraphicsDropShadowEffect()
@@ -814,11 +781,11 @@ class SimpleAssistantUI(QWidget):
         gradient.setColorAt(0, QColor("#164270"))
         gradient.setColorAt(1, QColor("#24548C"))
         painter.fillPath(path, QBrush(gradient))
-    
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-    
+
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.LeftButton:
             self.move(event.globalPos() - self._drag_pos)
@@ -838,7 +805,7 @@ class SimpleAssistantUI(QWidget):
                 if self._agent:
                     self._loop.run_until_complete(self._agent.close())
                 self._loop.close()
-        
+
         self._agent_thread = threading.Thread(target=run, daemon=True)
         self._agent_thread.start()
 
@@ -846,7 +813,7 @@ class SimpleAssistantUI(QWidget):
         """需求按钮点击 - 开始/停止录音"""
         if self._is_processing:
             return
-        
+
         if not self._is_recording:
             # 开始录音
             self._is_recording = True
@@ -873,7 +840,7 @@ class SimpleAssistantUI(QWidget):
         """提问按钮点击 - 开始/停止录音"""
         if self._is_processing:
             return
-        
+
         if not self._is_recording:
             # 开始录音
             self._is_recording = True
@@ -899,7 +866,7 @@ class SimpleAssistantUI(QWidget):
     def _on_recording_done(self, text: str, input_type: str):
         """录音完成"""
         self._is_recording = False
-        
+
         # 恢复按钮状态
         self._req_btn.setText("🎤需求")
         self._req_btn.setStyleSheet("""
@@ -910,7 +877,7 @@ class SimpleAssistantUI(QWidget):
             QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #FFC988, stop:1 #FF9D00); }
         """)
         self._req_btn.setEnabled(True)
-        
+
         self._ask_btn.setText("❓提问")
         self._ask_btn.setStyleSheet("""
             QPushButton {
@@ -920,9 +887,9 @@ class SimpleAssistantUI(QWidget):
             QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #7c94f4, stop:1 #8b5fbf); }
         """)
         self._ask_btn.setEnabled(True)
-        
+
         self._input.setPlaceholderText("输入需求或问题...")
-        
+
         if text:
             self._input.setText(text)
             # 根据输入类型处理
@@ -945,7 +912,7 @@ class SimpleAssistantUI(QWidget):
         self._input.clear()
         self._is_processing = True
         self._set_buttons_enabled(False)
-        
+
         if self._agent and self._loop:
             asyncio.run_coroutine_threadsafe(self._agent.process_requirement(text), self._loop)
 
@@ -959,7 +926,7 @@ class SimpleAssistantUI(QWidget):
         self._input.clear()
         self._is_processing = True
         self._set_buttons_enabled(False)
-        
+
         if self._agent and self._loop:
             asyncio.run_coroutine_threadsafe(self._agent.process_question(text), self._loop)
 
@@ -987,20 +954,20 @@ class SimpleAssistantUI(QWidget):
     def _on_status_changed(self, status: str):
         """状态变化"""
         self._input.setPlaceholderText(status)
-    
+
     def _on_processing_done(self):
         """处理完成"""
         self._is_processing = False
         self._set_buttons_enabled(True)
         self._input.setPlaceholderText("输入需求或问题...")
-    
+
     def closeEvent(self, event):
         """关闭窗口时，不废话，直接强制杀进程"""
         from PyQt5.QtCore import QTimer
-        
+
         # 1. 界面先接受关闭指令，让窗口消失
         event.accept()
-        
+
         # 2. 尝试通知后台停止（尽人事）
         if self._agent and self._loop:
             try:
@@ -1008,7 +975,7 @@ class SimpleAssistantUI(QWidget):
                 self._loop.call_soon_threadsafe(self._loop.stop)
             except:
                 pass
-        
+
         # 3. 【最关键的一步】启动核弹倒计时
         # 200毫秒后，不管后台有没有线程卡住（比如那个 VL API ReadError），直接终结进程
         print("正在强制退出系统...")
@@ -1018,13 +985,13 @@ class SimpleAssistantUI(QWidget):
 def main():
     logger.remove()
     logger.add(sys.stderr, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
-    
+
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 12))
-    
+
     window = SimpleAssistantUI()
     window.show()
-    
+
     sys.exit(app.exec_())
 
 

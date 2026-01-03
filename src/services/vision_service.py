@@ -1,4 +1,4 @@
-"""视觉服务 - 两层架构：页面状态分析 + 精确元素定位"""
+"""视觉服务 - 页面状态分析"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import io
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 import httpx
 from loguru import logger
@@ -33,17 +32,13 @@ class VLConfig:
     base_url: str = "https://www.sophnet.com/api/open-apis/v1"
     # 轻量级模型 - 用于页面状态分析
     model_light: str = "Qwen2.5-VL-72B-Instruct"
-    # 重量级模型 - 用于精确元素定位
-    model_heavy: str = "Qwen3-VL-235B-A22B-Instruct"
-    # OCR 模型 [新增]
-    model_ocr: str = "deepseek-ocr"
     # 兼容旧配置
     model: str = ""
 
 
 @dataclass
 class ScreenStateAnalysis:
-    """第一层：页面状态分析结果（不含坐标）"""
+    """第一层：页面状态分析结果"""
     app_name: str = ""                          # 当前应用名称
     screen_state: str = ""                      # 页面状态描述
     page_status: PageStatus = PageStatus.NORMAL # 页面状态枚举
@@ -68,7 +63,7 @@ class ScreenElement:
     confidence: float = 0.0
     is_clickable: bool = False
     is_input: bool = False
-    
+
     def get_center(self) -> tuple[int, int]:
         """获取元素中心点坐标"""
         x, y, w, h = self.bbox
@@ -87,92 +82,38 @@ class ScreenAnalysis:
 
 
 class VisionService:
-    """视觉服务 - 两层架构"""
-    
-    def __init__(self, vl_config: Optional[VLConfig] = None) -> None:
+    """视觉服务 - 页面状态分析"""
+
+    def __init__(self, vl_config: VLConfig | None = None) -> None:
         if vl_config:
             self._config = vl_config
-            # 如果只传了 model，自动设置为 heavy
-            if vl_config.model and not vl_config.model_heavy:
-                self._config.model_heavy = vl_config.model
         else:
             self._config = VLConfig(
                 api_key=config.api.api_key,
                 model_light=config.api.vl_model_light,
-                model_heavy=config.api.vl_model_heavy,
-                
-                # 🟢 [修改这里] 确保参数名是 model_ocr，而不是 ocr_model
-                model_ocr="DeepSeek-OCR"  
             )
-        
-        self._client: Optional[httpx.AsyncClient] = None
-        
-        self._client: Optional[httpx.AsyncClient] = None
-    
+
+        self._client: httpx.AsyncClient | None = None
+
     def _build_api_url(self) -> str:
         """构建API URL"""
         return f"{self._config.base_url}/chat/completions"
-    
-    def _build_ocr_url(self) -> str:
-        """构建 OCR API URL [新增]"""
-        return f"{self._config.base_url}/ocr"
-    
+
     async def initialize(self) -> None:
         """初始化服务"""
         self._client = httpx.AsyncClient(timeout=300.0)
-        logger.info("Vision服务初始化完成（两层架构 + OCR）")
+        logger.info("Vision服务初始化完成")
         logger.info(f"  - VL API URL: {self._build_api_url()}")
-        logger.info(f"  - OCR API URL: {self._build_ocr_url()}")
-        logger.info(f"  - 轻量模型: {self._config.model_light}")
-        logger.info(f"  - 重量模型: {self._config.model_heavy}")
-        logger.info(f"  - OCR模型: {self._config.model_ocr}")
-    
+        logger.info(f"  - 模型: {self._config.model_light}")
+
     async def close(self) -> None:
         """关闭服务"""
         if self._client:
             await self._client.aclose()
             self._client = None
 
-            # ==================== OCR 识别 [新增] ====================
-
-    async def extract_text_from_bytes(self, image_bytes: bytes) -> str:
-        """
-        使用 DeepSeek-OCR 模型通过 Chat 接口提取文字
-        """
-        if not self._client or not image_bytes:
-            return ""
-            
-        try:
-            # 1. 编码图片
-            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-            
-            # 2. 构造标准 Chat 消息 (符合你的 curl 结构)
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "ocr"}, # 简单的 Prompt 触发 OCR
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
-                ]
-            }]
-            
-            logger.info(f"正在调用 OCR (Model: {self._config.model_ocr})...")
-            
-            # 3. 复用 _call_vl_api (它已经处理了 URL、Header 和 Response 解析)
-            content = await self._call_vl_api(
-                messages,
-                model=self._config.model_ocr, # 使用 DeepSeek-OCR
-                max_tokens=2000
-            )
-            
-            logger.info(f"OCR 识别成功，长度: {len(content)}")
-            return content
-
-        except Exception as e:
-            logger.error(f"OCR 调用失败: {e}")
-            return ""
-
     # ==================== 通用方法 ====================
-    
+
     async def _call_vl_api(
         self,
         messages: list[dict],
@@ -183,14 +124,14 @@ class VisionService:
         """调用VL API（带重试机制）"""
         if not self._client:
             raise RuntimeError("Vision服务未初始化")
-        
+
         url = self._build_api_url()
         last_error = None
-        
+
         for attempt in range(max_retries):
             try:
                 logger.debug(f"调用VL API: model={model}, 尝试 {attempt + 1}/{max_retries}")
-                
+
                 response = await self._client.post(
                     url,
                     json={
@@ -204,16 +145,16 @@ class VisionService:
                     },
                 )
                 response.raise_for_status()
-                
+
                 result = response.json()
                 if "choices" in result and len(result["choices"]) > 0:
                     content = result["choices"][0]["message"]["content"]
                     logger.debug(f"VL API响应长度: {len(content)}")
                     return content
-                
+
                 logger.warning(f"未知的API响应格式: {result}")
                 return str(result)
-                    
+
             except httpx.HTTPStatusError as e:
                 logger.error(f"VL API HTTP错误: {e.response.status_code}")
                 logger.error(f"响应内容: {e.response.text}")
@@ -232,19 +173,19 @@ class VisionService:
                 logger.error(f"VL API调用失败: {type(e).__name__}: {e}")
                 last_error = e
                 break
-        
+
         # 所有重试都失败
         raise last_error or RuntimeError("VL API调用失败")
-    
+
     async def capture_screen(self) -> tuple[bytes, tuple[int, int]]:
         """截取屏幕，返回(图片数据, 原始尺寸)"""
         try:
             import mss
-            
+
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
                 screenshot = sct.grab(monitor)
-                
+
                 img = Image.frombytes(
                     "RGB",
                     screenshot.size,
@@ -252,18 +193,18 @@ class VisionService:
                     "raw",
                     "BGRX",
                 )
-                
+
                 original_size = img.size
                 img = self._resize_if_needed(img)
-                
+
                 buffer = io.BytesIO()
                 img.save(buffer, format="PNG", optimize=True)
                 return buffer.getvalue(), original_size
-                
+
         except Exception as e:
             logger.error(f"截屏失败: {e}")
             return b"", (0, 0)
-    
+
     def _resize_if_needed(self, img: Image.Image, max_size: int = 1280) -> Image.Image:
         """如果图片太大则缩放"""
         width, height = img.size
@@ -273,23 +214,9 @@ class VisionService:
             logger.debug(f"缩放图片: {width}x{height} -> {new_size[0]}x{new_size[1]}")
             return img.resize(new_size, Image.Resampling.LANCZOS)
         return img
-    
-    def _get_scale_ratio(self, original_size: tuple[int, int], max_size: int = 1280) -> float:
-        """计算缩放比例"""
-        width, height = original_size
-        if width > max_size or height > max_size:
-            return min(max_size / width, max_size / height)
-        return 1.0
-    
-    def _scale_bbox(self, bbox: tuple[int, int, int, int], scale: float) -> tuple[int, int, int, int]:
-        """将bbox坐标从缩放图片映射回原始屏幕"""
-        if scale == 1.0 or scale == 0:
-            return bbox
-        x, y, w, h = bbox
-        return (int(x / scale), int(y / scale), int(w / scale), int(h / scale))
 
-    # ==================== 第一层：页面状态分析 ====================
-    
+    # ==================== 页面状态分析 ====================
+
     async def analyze_screen_state(
         self,
         screenshot: bytes,
@@ -306,11 +233,11 @@ class VisionService:
         """
         if not self._client or not screenshot:
             return ScreenStateAnalysis()
-        
+
         try:
             image_base64 = base64.b64encode(screenshot).decode("utf-8")
             prompt = self._build_state_analysis_prompt(user_intent)
-            
+
             messages = [{
                 "role": "user",
                 "content": [
@@ -318,19 +245,19 @@ class VisionService:
                     {"type": "text", "text": prompt}
                 ]
             }]
-            
+
             content = await self._call_vl_api(
                 messages,
                 model=self._config.model_light,
                 max_tokens=1500,
             )
-            
+
             return self._parse_state_analysis(content)
-            
+
         except Exception as e:
             logger.error(f"页面状态分析失败: {e}")
             return ScreenStateAnalysis()
-    
+
     def _build_state_analysis_prompt(self, user_intent: str) -> str:
         """构建页面状态分析提示词"""
         prompt = """分析这个屏幕截图，准确描述当前页面状态。只返回JSON，不要其他文字。
@@ -367,19 +294,19 @@ class VisionService:
 1. 不需要返回精确坐标，只需要描述元素的大致位置
 2. available_elements 只列出可交互的元素（按钮、输入框、链接等）
 3. 用老年人能理解的语言描述"""
-        
+
         if user_intent:
             prompt += f"\n\n用户想要：{user_intent}\n请重点关注与用户意图相关的元素，并判断当前屏幕状态是否已经满足用户需求。"
-        
+
         return prompt
-    
+
     def _parse_state_analysis(self, content: str) -> ScreenStateAnalysis:
         """解析页面状态分析结果"""
         try:
             json_str = self._extract_json(content)
             if json_str:
                 data = json.loads(json_str)
-                
+
                 # 解析页面状态枚举
                 status_str = data.get("page_status", "normal").lower()
                 status_map = {
@@ -390,7 +317,7 @@ class VisionService:
                     "login": PageStatus.LOGIN,
                 }
                 page_status = status_map.get(status_str, PageStatus.UNKNOWN)
-                
+
                 return ScreenStateAnalysis(
                     app_name=data.get("app_name", ""),
                     screen_state=data.get("screen_state", ""),
@@ -406,223 +333,11 @@ class VisionService:
                 )
         except Exception as e:
             logger.warning(f"解析页面状态失败: {e}")
-        
+
         return ScreenStateAnalysis(description=content)
 
-    # ==================== 第二层：精确元素定位 ====================
-    
-    async def locate_element(
-        self,
-        screenshot: bytes,
-        element_description: str,
-        original_size: tuple[int, int] = (0, 0),
-    ) -> Optional[ScreenElement]:
-        """
-        第二层分析：精确定位单个元素
-        
-        使用 Qwen3-VL-235B-A22B-Instruct，返回精确坐标
-        仅在需要知道元素具体位置时调用
-        """
-        if not self._client or not screenshot:
-            return None
-        
-        try:
-            image_base64 = base64.b64encode(screenshot).decode("utf-8")
-            prompt = self._build_locate_element_prompt(element_description)
-            
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-            
-            content = await self._call_vl_api(
-                messages,
-                model=self._config.model_heavy,
-                max_tokens=500,
-            )
-            
-            element = self._parse_single_element(content)
-            
-            # 坐标映射回原始屏幕
-            if element and original_size != (0, 0):
-                scale = self._get_scale_ratio(original_size)
-                if scale != 1.0:
-                    element.bbox = self._scale_bbox(element.bbox, scale)
-            
-            return element
-            
-        except Exception as e:
-            logger.error(f"元素定位失败: {e}")
-            return None
-    
-    def _build_locate_element_prompt(self, element_description: str) -> str:
-        """构建元素定位提示词"""
-        return f"""在截图中找到"{element_description}"这个元素，返回它的精确位置。
-
-只返回JSON，格式：
-{{
-  "found": true,
-  "element_type": "button/input/link/icon/text",
-  "text": "元素上的文字",
-  "description": "元素描述",
-  "bbox_2d": [左上角x, 左上角y, 右下角x, 右下角y],
-  "confidence": 0.95,
-  "is_clickable": true,
-  "is_input": false
-}}
-
-如果找不到，返回：
-{{"found": false, "reason": "找不到的原因"}}
-
-注意：bbox_2d 是像素坐标，格式为 [x1, y1, x2, y2]"""
-    
-    def _parse_single_element(self, content: str) -> Optional[ScreenElement]:
-        """解析单个元素定位结果"""
-        try:
-            json_str = self._extract_json(content)
-            if json_str:
-                data = json.loads(json_str)
-                
-                if not data.get("found", False):
-                    logger.info(f"未找到元素: {data.get('reason', '未知原因')}")
-                    return None
-                
-                bbox = data.get("bbox_2d", [0, 0, 0, 0])
-                bbox_xywh = self._convert_bbox_to_xywh(bbox)
-                
-                return ScreenElement(
-                    element_type=data.get("element_type", ""),
-                    text=data.get("text", ""),
-                    description=data.get("description", ""),
-                    bbox=bbox_xywh,
-                    confidence=data.get("confidence", 0.0),
-                    is_clickable=data.get("is_clickable", False),
-                    is_input=data.get("is_input", False),
-                )
-        except Exception as e:
-            logger.warning(f"解析元素定位结果失败: {e}")
-        
-        return None
-
-    # ==================== 兼容旧接口 ====================
-    
-    async def analyze_screen(
-        self,
-        screenshot: bytes,
-        user_intent: str = "",
-        original_size: tuple[int, int] = (0, 0),
-    ) -> ScreenAnalysis:
-        """
-        完整屏幕分析（兼容旧接口）
-        
-        使用重量级模型，返回所有元素的精确坐标
-        注意：这个方法较慢，建议优先使用 analyze_screen_state + locate_element
-        """
-        if not self._client or not screenshot:
-            return ScreenAnalysis()
-        
-        try:
-            image_base64 = base64.b64encode(screenshot).decode("utf-8")
-            prompt = self._build_full_analysis_prompt(user_intent)
-            
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-            
-            content = await self._call_vl_api(
-                messages,
-                model=self._config.model_heavy,
-                max_tokens=4000,
-            )
-            
-            analysis = self._parse_full_analysis(content)
-            
-            # 坐标映射
-            if original_size != (0, 0):
-                scale = self._get_scale_ratio(original_size)
-                if scale != 1.0:
-                    for elem in analysis.elements:
-                        elem.bbox = self._scale_bbox(elem.bbox, scale)
-            
-            return analysis
-            
-        except Exception as e:
-            logger.error(f"完整屏幕分析失败: {e}")
-            return ScreenAnalysis()
-    
-    def _build_full_analysis_prompt(self, user_intent: str) -> str:
-        """构建完整分析提示词"""
-        prompt = """分析截图中的UI元素，只返回JSON，不要其他文字。
-
-格式：
-{
-  "app_name": "应用名称",
-  "screen_type": "app",
-  "elements": [
-    {"element_type": "button", "text": "文字", "description": "描述", "bbox_2d": [x1, y1, x2, y2], "is_clickable": true, "is_input": false}
-  ],
-  "description": "屏幕描述",
-  "suggested_actions": ["建议操作"],
-  "warnings": []
-}
-
-说明：
-- element_type: button/input/link/menu/tab/icon/text
-- bbox_2d: [左上角x, 左上角y, 右下角x, 右下角y] 像素坐标
-- 请识别所有可见的按钮、输入框、链接、菜单等可交互元素"""
-        
-        if user_intent:
-            prompt += f"\n用户想要：{user_intent}"
-        
-        return prompt
-    
-    def _parse_full_analysis(self, content: str) -> ScreenAnalysis:
-        """解析完整分析结果"""
-        try:
-            json_str = self._extract_json(content)
-            if json_str:
-                try:
-                    data = json.loads(json_str)
-                except json.JSONDecodeError:
-                    data = self._try_fix_truncated_json(json_str)
-                
-                if data:
-                    elements = []
-                    for elem_data in data.get("elements", []):
-                        bbox = elem_data.get("bbox_2d") or elem_data.get("bbox", [0, 0, 0, 0])
-                        bbox_xywh = self._convert_bbox_to_xywh(bbox)
-                        
-                        elements.append(ScreenElement(
-                            element_type=elem_data.get("element_type", ""),
-                            text=elem_data.get("text", ""),
-                            description=elem_data.get("description", ""),
-                            bbox=bbox_xywh,
-                            is_clickable=elem_data.get("is_clickable", False),
-                            is_input=elem_data.get("is_input", False),
-                        ))
-                    
-                    return ScreenAnalysis(
-                        app_name=data.get("app_name", ""),
-                        screen_type=data.get("screen_type", ""),
-                        elements=elements,
-                        description=data.get("description", ""),
-                        suggested_actions=data.get("suggested_actions", []),
-                        warnings=data.get("warnings", []),
-                    )
-        except Exception as e:
-            logger.warning(f"解析完整分析结果失败: {e}")
-        
-        return ScreenAnalysis(description=content)
-
     # ==================== 验证方法 ====================
-    
+
     async def verify_step_completion(
         self,
         before_screenshot: bytes,
@@ -644,11 +359,11 @@ class VisionService:
         """
         if not self._client:
             raise RuntimeError("Vision服务未初始化")
-        
+
         try:
             before_b64 = base64.b64encode(before_screenshot).decode("utf-8")
             after_b64 = base64.b64encode(after_screenshot).decode("utf-8")
-            
+
             prompt = f"""比较这两张截图（第一张是操作前，第二张是操作后），判断用户的操作是否成功完成。
 
 操作描述：{step_description}
@@ -671,7 +386,7 @@ class VisionService:
 - 如果页面没有明显变化，可能操作没有生效
 - 如果出现错误提示、加载失败等，应判断为失败
 - 用老年人能理解的语言描述"""
-            
+
             messages = [{
                 "role": "user",
                 "content": [
@@ -680,19 +395,19 @@ class VisionService:
                     {"type": "text", "text": prompt}
                 ]
             }]
-            
+
             content = await self._call_vl_api(
                 messages,
                 model=self._config.model_light,  # 使用轻量模型
                 max_tokens=800,
             )
-            
+
             return self._parse_step_verification(content)
-            
+
         except Exception as e:
             logger.error(f"步骤验证失败: {e}")
             return False, "", "无法验证操作结果"
-    
+
     def _parse_step_verification(self, content: str) -> tuple[bool, str, str]:
         """解析步骤验证结果"""
         try:
@@ -705,11 +420,11 @@ class VisionService:
                 return success, changes, reason
         except Exception as e:
             logger.warning(f"解析步骤验证结果失败: {e}")
-        
+
         # 解析失败时，尝试从文本判断
         success = "成功" in content[:100] or "是" in content[:50]
         return success, "", content[:200]
-    
+
     async def verify_action_result(
         self,
         before_screenshot: bytes,
@@ -719,11 +434,11 @@ class VisionService:
         """验证操作结果（使用轻量模型）"""
         if not self._client:
             raise RuntimeError("Vision服务未初始化")
-        
+
         try:
             before_b64 = base64.b64encode(before_screenshot).decode("utf-8")
             after_b64 = base64.b64encode(after_screenshot).decode("utf-8")
-            
+
             prompt = f"""比较这两张屏幕截图（前后对比），判断操作是否成功。
 
 预期变化：{expected_change}
@@ -734,7 +449,7 @@ class VisionService:
 3. 如果失败，可能的原因是什么？
 
 用简单的语言回答，适合老年人理解。"""
-            
+
             messages = [{
                 "role": "user",
                 "content": [
@@ -743,32 +458,85 @@ class VisionService:
                     {"type": "text", "text": prompt}
                 ]
             }]
-            
+
             content = await self._call_vl_api(
                 messages,
                 model=self._config.model_light,  # 使用轻量模型
                 max_tokens=500,
             )
-            
+
             success = "是" in content[:50] or "成功" in content[:50]
             return success, content
-            
+
         except Exception as e:
             logger.error(f"验证操作结果失败: {e}")
             return False, "无法验证操作结果"
-    
-    async def find_element(
+
+    async def check_goal_achieved(
         self,
+        task_goal: str,
         screenshot: bytes,
-        element_description: str,
-        original_size: tuple[int, int] = (0, 0),
-    ) -> Optional[ScreenElement]:
-        """查找特定元素（兼容旧接口，内部调用 locate_element）"""
-        return await self.locate_element(screenshot, element_description, original_size)
+        screen_state: ScreenStateAnalysis,
+    ) -> tuple[bool, str]:
+        if not self._client or not task_goal or not screenshot:
+            return False, ""
+
+        try:
+            image_b64 = base64.b64encode(screenshot).decode("utf-8")
+
+            prompt = f"""判断用户的任务目标是否已经达成。
+
+任务目标：{task_goal}
+
+当前页面状态：
+- 应用：{screen_state.app_name}
+- 页面：{screen_state.screen_state}
+- 描述：{screen_state.description}
+
+请判断：
+1. 当前页面是否显示任务目标已经完成？
+2. 用户是否已经达到了他想要的结果？
+
+只返回JSON：
+{{
+  "goal_achieved": true或false,
+  "reason": "判断理由，用简单语言描述"
+}}
+
+注意：
+- 不要因为还有其他可以做的操作就判断为未完成"""
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+
+            content = await self._call_vl_api(
+                messages,
+                model=self._config.model_light,
+                max_tokens=300,
+            )
+
+            json_str = self._extract_json(content)
+            if json_str:
+                data = json.loads(json_str)
+                return bool(data.get("goal_achieved", False)), str(data.get("reason", "")).strip()
+        except Exception as e:
+            logger.warning(f"检查任务目标失败: {e}")
+
+        return False, ""
 
     # ==================== 工具方法 ====================
-    
-    def _extract_json(self, content: str) -> Optional[str]:
+
+    def _extract_json(self, content: str) -> str | None:
         """从响应中提取JSON字符串"""
         # 移除markdown代码块标记
         if "```json" in content:
@@ -781,111 +549,11 @@ class VisionService:
             end = content.find("```", start)
             if end > start:
                 return content[start:end].strip()
-        
+
         # 直接查找JSON对象
         start = content.find("{")
         end = content.rfind("}") + 1
         if start >= 0 and end > start:
             return content[start:end]
-        
-        return None
-    
-    def _convert_bbox_to_xywh(self, bbox: list) -> tuple[int, int, int, int]:
-        """
-        将bbox转换为统一的 (x, y, width, height) 格式
-        
-        支持两种输入格式：
-        1. [x1, y1, x2, y2] - 左上角和右下角坐标
-        2. [x, y, w, h] - 左上角坐标和宽高
-        """
-        if len(bbox) != 4:
-            return (0, 0, 0, 0)
-        
-        v0, v1, v2, v3 = [int(v) for v in bbox]
-        
-        # 判断是否为 [x1, y1, x2, y2] 格式
-        if v2 > v0 and v3 > v1:
-            width = v2 - v0
-            height = v3 - v1
-            if width > 5 or height > 5:
-                return (v0, v1, width, height)
-        
-        return (v0, v1, v2, v3)
-    
-    def _try_fix_truncated_json(self, json_str: str) -> Optional[dict]:
-        """尝试修复被截断的JSON"""
-        elements_start = json_str.find('"elements"')
-        if elements_start == -1:
-            return None
-        
-        array_start = json_str.find('[', elements_start)
-        if array_start == -1:
-            return None
-        
-        # 找最后一个完整的元素对象
-        last_complete = -1
-        brace_count = 0
-        in_string = False
-        escape_next = False
-        
-        for i in range(array_start, len(json_str)):
-            char = json_str[i]
-            
-            if escape_next:
-                escape_next = False
-                continue
-            if char == '\\':
-                escape_next = True
-                continue
-            if char == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    last_complete = i
-        
-        if last_complete > array_start:
-            fixed_json = json_str[:last_complete + 1] + ']}'
-            try:
-                return json.loads(fixed_json)
-            except json.JSONDecodeError:
-                pass
-        
-        # 尝试正则提取
-        try:
-            import re
-            app_name_match = re.search(r'"app_name"\s*:\s*"([^"]*)"', json_str)
-            screen_type_match = re.search(r'"screen_type"\s*:\s*"([^"]*)"', json_str)
-            
-            elements = []
-            element_pattern = r'\{\s*"element_type"\s*:\s*"([^"]*)"\s*,\s*"text"\s*:\s*"([^"]*)"\s*,\s*"description"\s*:\s*"([^"]*)"\s*,\s*"bbox_2d"\s*:\s*\[(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\]'
-            
-            for match in re.finditer(element_pattern, json_str):
-                elements.append({
-                    "element_type": match.group(1),
-                    "text": match.group(2),
-                    "description": match.group(3),
-                    "bbox_2d": [int(match.group(4)), int(match.group(5)), int(match.group(6)), int(match.group(7))],
-                    "is_clickable": True,
-                    "is_input": False,
-                })
-            
-            if elements:
-                logger.info(f"通过正则修复JSON，提取到 {len(elements)} 个元素")
-                return {
-                    "app_name": app_name_match.group(1) if app_name_match else "",
-                    "screen_type": screen_type_match.group(1) if screen_type_match else "",
-                    "elements": elements,
-                    "description": "",
-                    "suggested_actions": [],
-                    "warnings": [],
-                }
-        except Exception as e:
-            logger.debug(f"正则修复失败: {e}")
-        
+
         return None
